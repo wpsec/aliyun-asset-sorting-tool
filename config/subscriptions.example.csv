@@ -1,0 +1,4 @@
+# 每行一个订阅配置，格式：profile,输出目录名,多账号scope
+# scope 可留空；不要在本文件写 AK/SK。
+dev资产梳理,dev资产梳理,
+prod资产梳理,prod资产梳理,

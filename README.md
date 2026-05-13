@@ -23,6 +23,25 @@
 - RAM 策略不使用 Action 通配符，不包含 Deny，不授予创建、修改、删除、启停、授权、执行命令、读取对象内容、读取日志正文、读取密钥明文等权限。
 - 专用 RAM 用户或角色只建议绑定 `policies/` 下的 5 份策略，不叠加 `AdministratorAccess`、`*FullAccess` 或宽泛系统只读策略。
 
+## 运行依赖
+
+- Python 3.9+。
+- 阿里云 CLI 3.x，命令名为 `aliyun`，需要能在当前 shell 中直接执行。
+- 已在本机 `aliyun` CLI 中配置好只读 RAM 用户或角色的 profile。
+- 该 RAM 用户或角色已绑定 `policies/` 下的 5 份自定义只读策略。
+
+检查 CLI 是否可用：
+
+```bash
+aliyun version
+```
+
+脚本不会接收 AK/SK 参数，也不会读取或输出 AK/SK；运行时只把 profile 名传给 `aliyun` CLI，例如：
+
+```bash
+python3 aliyun_asset_inventory.py --profile dev资产梳理
+```
+
 ## 策略文件
 
 需要在 RAM 中分别创建 5 个自定义策略，并全部绑定到同一个资产梳理 RAM 用户或角色：

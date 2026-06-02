@@ -322,6 +322,7 @@ class DetailedAssets:
     ecs_security_groups: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ecs_network_interfaces: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ecs_security_group_rules: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    vpc_vswitches: list[dict[str, str]] = dataclasses.field(default_factory=list)
     vpc_eips: list[dict[str, str]] = dataclasses.field(default_factory=list)
     vpc_nat_gateways: list[dict[str, str]] = dataclasses.field(default_factory=list)
     vpc_snat_entries: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -348,6 +349,7 @@ class DetailedAssets:
     ecs_snapshot_policy_associations: list[dict[str, str]] = dataclasses.field(default_factory=list)
     rds_instances: list[dict[str, str]] = dataclasses.field(default_factory=list)
     rds_net_infos: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    rds_ip_arrays: list[dict[str, str]] = dataclasses.field(default_factory=list)
     redis_instances: list[dict[str, str]] = dataclasses.field(default_factory=list)
     redis_net_infos: list[dict[str, str]] = dataclasses.field(default_factory=list)
     metric_summaries: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -423,6 +425,25 @@ VERIFY_CHECKS = [
         ],
     },
 ]
+
+TOPOLOGY_RELEVANT_APIS = {
+    "DescribeVSwitches",
+    "DescribeNetworkInterfaces",
+    "DescribeEipAddresses",
+    "DescribeNatGateways",
+    "DescribeVpnGateways",
+    "DescribeVpnConnections",
+    "DescribeSslVpnServers",
+    "DescribeLoadBalancers",
+    "ListLoadBalancers",
+    "DescribeLoadBalancerListeners",
+    "ListListeners",
+    "ListServerGroups",
+    "ListServerGroupServers",
+    "DescribeDBInstances",
+    "DescribeInstances",
+    "DescribeDBInstanceNetInfo",
+}
 
 
 class AliyunCliError(RuntimeError):
@@ -1046,6 +1067,29 @@ def normalize_ecs_security_group_rule(
     return {key: str(value) for key, value in row.items()}
 
 
+def normalize_vswitch(
+    item: dict[str, Any],
+    subscription: Subscription,
+    account_id: str,
+    region_id: str,
+) -> dict[str, str]:
+    row = {
+        "subscription": subscription.label,
+        "account_id": pick(item, "AccountId", "OwnerId") or account_id,
+        "region_id": pick(item, "RegionId") or region_id,
+        "zone_id": pick(item, "ZoneId"),
+        "vswitch_id": pick(item, "VSwitchId"),
+        "resource_id": pick(item, "VSwitchId"),
+        "resource_name": pick(item, "VSwitchName", "Name", "VSwitchId"),
+        "status": pick(item, "Status"),
+        "vpc_id": pick(item, "VpcId"),
+        "cidr_block": pick(item, "CidrBlock"),
+        "available_ip_address_count": pick(item, "AvailableIpAddressCount"),
+        "creation_time": pick(item, "CreationTime"),
+    }
+    return {key: str(value) for key, value in row.items()}
+
+
 def normalize_vpc_eip(
     item: dict[str, Any],
     subscription: Subscription,
@@ -1202,6 +1246,39 @@ def normalize_load_balancer(
     return {key: str(value) for key, value in row.items()}
 
 
+def extract_explicit_server_group_ids(item: dict[str, Any]) -> str:
+    ids: list[str] = []
+
+    def append_from_value(value: Any) -> None:
+        for entry in as_list(value):
+            if isinstance(entry, dict):
+                server_group_id = str(pick(entry, "ServerGroupId"))
+                if server_group_id:
+                    ids.append(server_group_id)
+            elif entry not in (None, ""):
+                ids.append(str(entry))
+
+    append_from_value(pick(item, "DefaultServerGroupId", "ServerGroupId", "ServerGroupIds"))
+    append_from_value(pick_path(item, "ForwardGroupConfig", "ServerGroupTuples"))
+    append_from_value(pick_path(item, "ServerGroupTuples", "ServerGroupTuple"))
+    append_from_value(pick_path(item, "DefaultActions", "ForwardGroupConfig", "ServerGroupTuples"))
+
+    for action in as_list(item.get("DefaultActions")):
+        if not isinstance(action, dict):
+            continue
+        append_from_value(pick(action, "ServerGroupId"))
+        append_from_value(pick_path(action, "ForwardGroupConfig", "ServerGroupTuples"))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for server_group_id in ids:
+        if not server_group_id or server_group_id in seen:
+            continue
+        seen.add(server_group_id)
+        deduped.append(server_group_id)
+    return ";".join(deduped)
+
+
 def normalize_listener(
     item: dict[str, Any],
     subscription: Subscription,
@@ -1219,6 +1296,7 @@ def normalize_listener(
         "protocol": pick(item, "ListenerProtocol", "Protocol"),
         "port": pick(item, "ListenerPort", "Port"),
         "status": pick(item, "ListenerStatus", "Status"),
+        "server_group_ids": extract_explicit_server_group_ids(item),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -1240,6 +1318,7 @@ def normalize_server_group(
         "server_group_type": pick(item, "ServerGroupType"),
         "protocol": pick(item, "Protocol"),
         "vpc_id": pick(item, "VpcId"),
+        "load_balancer_id": pick(item, "LoadBalancerId"),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -1410,7 +1489,10 @@ def normalize_rds_instance(
         "engine_version": pick(item, "EngineVersion"),
         "connection_mode": pick(item, "ConnectionMode"),
         "charge_type": pick(item, "PayType", "DBInstanceNetType"),
+        "vpc_id": pick(item, "VpcId", "VPCId", "VpcInstanceId"),
+        "vswitch_id": pick(item, "VSwitchId", "VswitchId"),
         "tags": normalize_tags(pick_path(item, "Tags", "Tag")),
+        "resource_group_id": pick(item, "ResourceGroupId"),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -1432,7 +1514,10 @@ def normalize_redis_instance(
         "engine": pick(item, "Engine"),
         "engine_version": pick(item, "EngineVersion"),
         "charge_type": pick(item, "ChargeType"),
+        "vpc_id": pick(item, "VpcId", "VPCId", "VpcInstanceId"),
+        "vswitch_id": pick(item, "VSwitchId", "VswitchId"),
         "tags": normalize_tags(pick_path(item, "Tags", "Tag")),
+        "resource_group_id": pick(item, "ResourceGroupId"),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -1455,8 +1540,32 @@ def normalize_db_net_info(
         "address_type": pick(item, "AddressType"),
         "connection_string": pick(item, "ConnectionString", "ConnectionStringPrefix"),
         "port": pick(item, "Port"),
+        "vpc_id": pick(item, "VpcId", "VPCId", "VpcInstanceId") or base.get("vpc_id", ""),
+        "vswitch_id": pick(item, "VSwitchId", "VswitchId") or base.get("vswitch_id", ""),
         "tags": base.get("tags", ""),
         "resource_group_id": base.get("resource_group_id", ""),
+    }
+    return {key: str(value) for key, value in row.items()}
+
+
+def normalize_rds_ip_array(
+    item: dict[str, Any],
+    subscription: Subscription,
+    account_id: str,
+    region_id: str,
+    instance: dict[str, str],
+) -> dict[str, str]:
+    row = {
+        "subscription": subscription.label,
+        "account_id": pick(item, "AccountId", "OwnerId") or account_id or instance.get("account_id", ""),
+        "region_id": pick(item, "RegionId") or region_id or instance.get("region_id", ""),
+        "instance_id": instance.get("instance_id", ""),
+        "resource_id": instance.get("instance_id", ""),
+        "resource_name": instance.get("resource_name", ""),
+        "whitelist_name": pick(item, "DBInstanceIPArrayName", "WhitelistName", "Name"),
+        "whitelist_attribute": pick(item, "DBInstanceIPArrayAttribute", "WhitelistAttribute"),
+        "security_ip_list": pick(item, "SecurityIPList", "SecurityIps"),
+        "security_ip_type": pick(item, "SecurityIPType", "SecurityIpType"),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -1642,6 +1751,16 @@ def collect_detailed_assets(
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
             )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="ecs",
+                api="DescribeInstances",
+                status="query_failed",
+                message=str(exc),
+            )
 
         try:
             disks = paged_ecs_api(
@@ -1701,6 +1820,16 @@ def collect_detailed_assets(
                 f"[资产梳理] ECS弹性网卡详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="ecs",
+                api="DescribeNetworkInterfaces",
+                status="query_failed",
+                message=str(exc),
             )
 
         if should_collect_snapshot_policies:
@@ -1830,6 +1959,37 @@ def collect_vpc_details(
 ) -> None:
     for region_id in [region for region in regions if region]:
         try:
+            vswitches = paged_rpc_api(
+                args,
+                subscription,
+                "vpc",
+                "DescribeVSwitches",
+                region_id,
+                [("VSwitches", "VSwitch")],
+                page_size=50,
+            )
+            details.vpc_vswitches.extend(
+                normalize_vswitch(item, subscription, account_id, region_id)
+                for item in vswitches
+            )
+        except (AliyunCliError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"[资产梳理] VSwitch详情获取失败 订阅={subscription.label} "
+                f"地域={region_id} 错误={exc}",
+                file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="vpc",
+                api="DescribeVSwitches",
+                status="query_failed",
+                message=str(exc),
+            )
+
+        try:
             eips = paged_rpc_api(
                 args,
                 subscription,
@@ -1848,6 +2008,16 @@ def collect_vpc_details(
                 f"[资产梳理] EIP详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="vpc",
+                api="DescribeEipAddresses",
+                status="query_failed",
+                message=str(exc),
             )
 
         try:
@@ -1872,6 +2042,16 @@ def collect_vpc_details(
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
             )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="vpc",
+                api="DescribeNatGateways",
+                status="query_failed",
+                message=str(exc),
+            )
 
         try:
             vpn_gateways = paged_rpc_api(
@@ -1893,6 +2073,16 @@ def collect_vpc_details(
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
             )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="vpn",
+                api="DescribeVpnGateways",
+                status="query_failed",
+                message=str(exc),
+            )
 
         try:
             vpn_connections = paged_rpc_api(
@@ -1913,6 +2103,16 @@ def collect_vpc_details(
                 f"[资产梳理] VPN连接详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="vpn",
+                api="DescribeVpnConnections",
+                status="query_failed",
+                message=str(exc),
             )
 
         try:
@@ -2058,6 +2258,16 @@ def collect_clb_details(
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
             )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="slb",
+                api="DescribeLoadBalancers",
+                status="query_failed",
+                message=str(exc),
+            )
             continue
 
         try:
@@ -2116,6 +2326,16 @@ def collect_alb_details(
                 f"[资产梳理] ALB详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="alb",
+                api="ListLoadBalancers",
+                status="query_failed",
+                message=str(exc),
             )
 
         try:
@@ -2180,6 +2400,16 @@ def collect_alb_details(
                 f"地域={region_id}",
                 file=sys.stderr,
             )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="alb",
+                api="ListServerGroups",
+                status="query_failed",
+                message="ALB服务器组详情获取失败",
+            )
 
 
 def collect_nlb_details(
@@ -2210,6 +2440,16 @@ def collect_nlb_details(
                 f"[资产梳理] NLB详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="nlb",
+                api="ListLoadBalancers",
+                status="query_failed",
+                message=str(exc),
             )
 
         try:
@@ -2271,6 +2511,16 @@ def collect_nlb_details(
                 f"[资产梳理] NLB服务器组详情获取失败 订阅={subscription.label} "
                 f"地域={region_id}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="nlb",
+                api="ListServerGroups",
+                status="query_failed",
+                message="NLB服务器组详情获取失败",
             )
 
 
@@ -2572,11 +2822,28 @@ def collect_database_details(
                     instance,
                     details.rds_net_infos,
                 )
+                collect_rds_ip_arrays(
+                    args,
+                    subscription,
+                    account_id,
+                    instance,
+                    details.rds_ip_arrays,
+                )
         except (AliyunCliError, subprocess.TimeoutExpired) as exc:
             print(
                 f"[资产梳理] RDS详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="rds",
+                api="DescribeDBInstances",
+                status="query_failed",
+                message=str(exc),
             )
 
     for region_id in redis_regions:
@@ -2609,6 +2876,16 @@ def collect_database_details(
                 f"[资产梳理] Redis/Tair详情获取失败 订阅={subscription.label} "
                 f"地域={region_id} 错误={exc}",
                 file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id=region_id,
+                service="redis",
+                api="DescribeInstances",
+                status="query_failed",
+                message=str(exc),
             )
 
 
@@ -2645,6 +2922,49 @@ def collect_db_net_infos(
                 "net_type": "query_failed",
                 "connection_string": "",
                 "port": "",
+            }
+        )
+
+
+def collect_rds_ip_arrays(
+    args: argparse.Namespace,
+    subscription: Subscription,
+    account_id: str,
+    instance: dict[str, str],
+    output: list[dict[str, str]],
+) -> None:
+    instance_id = instance.get("instance_id", "")
+    if not instance_id:
+        return
+
+    try:
+        arrays = paged_rpc_api(
+            args,
+            subscription,
+            "rds",
+            "DescribeDBInstanceIPArrayList",
+            instance.get("region_id", ""),
+            [("Items", "DBInstanceIPArray")],
+            extra_args=["--DBInstanceId", instance_id],
+        )
+        output.extend(
+            normalize_rds_ip_array(item, subscription, account_id, instance.get("region_id", ""), instance)
+            for item in arrays
+        )
+    except (AliyunCliError, subprocess.TimeoutExpired):
+        output.append(
+            {
+                "subscription": subscription.label,
+                "account_id": account_id,
+                "region_id": instance.get("region_id", ""),
+                "instance_id": instance_id,
+                "resource_id": instance_id,
+                "resource_name": instance.get("resource_name", ""),
+                "whitelist_name": "",
+                "whitelist_attribute": "",
+                "security_ip_list": "",
+                "security_ip_type": "",
+                "status": "query_failed",
             }
         )
 
@@ -3303,6 +3623,11 @@ def collection_event_rows(details: DetailedAssets) -> list[dict[str, str]]:
         if row.get("net_type") == "query_failed"
     )
     rows.extend(
+        collection_event_from_row(row, "rds", "DescribeDBInstanceIPArrayList", "RDS白名单查询失败")
+        for row in details.rds_ip_arrays
+        if row.get("status") == "query_failed"
+    )
+    rows.extend(
         collection_event_from_row(row, "redis", "DescribeDBInstanceNetInfo", "Redis连接地址查询失败")
         for row in details.redis_net_infos
         if row.get("net_type") == "query_failed"
@@ -3344,6 +3669,700 @@ def collection_event_from_row(
         "status": "query_failed",
         "message": message,
     }
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def topology_dir_for(
+    args: argparse.Namespace,
+    subscription: Subscription,
+    subscriptions_count: int,
+) -> Path:
+    del subscriptions_count
+    base_dir = project_path(args.output_dir)
+    return base_dir / safe_dirname(subscription.label) / "topology"
+
+
+def merge_row(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+    merged = dict(base)
+    for key, value in extra.items():
+        if value not in (None, ""):
+            merged[key] = str(value)
+    return merged
+
+
+def mermaid_node_id(*parts: str) -> str:
+    joined = "_".join(part for part in parts if part)
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", joined).strip("_")
+    return cleaned or "node"
+
+
+def mermaid_label(*parts: str) -> str:
+    text = "<br/>".join(part for part in parts if part)
+    return text.replace('"', "'").replace("`", "'")
+
+
+def resource_display_name(row: dict[str, str], name_keys: tuple[str, ...], id_keys: tuple[str, ...]) -> str:
+    for key in name_keys:
+        if row.get(key):
+            return row[key]
+    for key in id_keys:
+        if row.get(key):
+            return row[key]
+    return "未命名资源"
+
+
+def summarize_security_groups(value: str) -> str:
+    groups = split_ids(value)
+    if not groups:
+        return ""
+    if len(groups) <= 3:
+        return ",".join(groups)
+    return f"{','.join(groups[:3])} 等{len(groups)}个"
+
+
+def build_vpc_bucket(vpc_row: dict[str, str] | None = None) -> dict[str, Any]:
+    return {
+        "vpc": vpc_row or {},
+        "resource_ids": set(),
+        "vswitches": [],
+        "ecs": [],
+        "enis": [],
+        "eips": [],
+        "nats": [],
+        "vpn_gateways": [],
+        "vpn_connections": [],
+        "ssl_vpn_servers": [],
+        "lbs": [],
+        "listeners": [],
+        "server_groups": [],
+        "server_group_servers": [],
+        "rds": [],
+        "redis": [],
+    }
+
+
+def add_bucket_row(
+    bucket: dict[str, Any],
+    kind: str,
+    row: dict[str, str],
+    *,
+    resource_keys: tuple[str, ...],
+) -> None:
+    bucket[kind].append(row)
+    for key in resource_keys:
+        value = row.get(key, "")
+        if value:
+            bucket["resource_ids"].add(value)
+    resource_id = row.get("resource_id", "")
+    if resource_id:
+        bucket["resource_ids"].add(resource_id)
+
+
+def topology_collection_events(
+    details: DetailedAssets,
+    *,
+    region_id: str = "",
+    resource_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
+    events = []
+    for row in collection_event_rows(details):
+        if row.get("api", "") not in TOPOLOGY_RELEVANT_APIS:
+            continue
+        if region_id and row.get("region_id", "") not in {"", region_id}:
+            continue
+        resource_id = row.get("resource_id", "")
+        if resource_ids and resource_id and resource_id not in resource_ids:
+            continue
+        events.append(row)
+    return events
+
+
+def build_topology_documents(
+    raw_rows: list[dict[str, str]],
+    details: DetailedAssets,
+) -> dict[str, str]:
+    subscription = next((row.get("subscription", "") for row in raw_rows if row.get("subscription")), "")
+    raw_vpcs = {
+        row.get("resource_id", ""): row
+        for row in filter_by_resource_type(raw_rows, {"ACS::VPC::VPC"})
+        if row.get("resource_id")
+    }
+    raw_vswitches = {
+        row.get("resource_id", ""): row
+        for row in filter_by_resource_type(raw_rows, {"ACS::VPC::VSwitch"})
+        if row.get("resource_id")
+    }
+    vswitches: dict[str, dict[str, str]] = {}
+    for vswitch_id, row in raw_vswitches.items():
+        vswitches[vswitch_id] = dict(row)
+        vswitches[vswitch_id]["vswitch_id"] = vswitch_id
+    for row in details.vpc_vswitches:
+        vswitch_id = row.get("vswitch_id") or row.get("resource_id")
+        if not vswitch_id:
+            continue
+        existing = vswitches.get(vswitch_id, {})
+        vswitches[vswitch_id] = merge_row(existing, row)
+
+    rds_net_infos_by_instance: dict[str, list[dict[str, str]]] = {}
+    for row in details.rds_net_infos:
+        instance_id = row.get("instance_id", "")
+        if instance_id:
+            rds_net_infos_by_instance.setdefault(instance_id, []).append(row)
+
+    redis_net_infos_by_instance: dict[str, list[dict[str, str]]] = {}
+    for row in details.redis_net_infos:
+        instance_id = row.get("instance_id", "")
+        if instance_id:
+            redis_net_infos_by_instance.setdefault(instance_id, []).append(row)
+
+    instance_to_vpc = {
+        row.get("instance_id", ""): row.get("vpc_id", "")
+        for row in details.ecs_instances
+        if row.get("instance_id") and row.get("vpc_id")
+    }
+    instance_to_vswitch = {
+        row.get("instance_id", ""): row.get("vswitch_id", "")
+        for row in details.ecs_instances
+        if row.get("instance_id") and row.get("vswitch_id")
+    }
+    vswitch_to_vpc = {
+        row.get("vswitch_id") or row.get("resource_id", ""): row.get("vpc_id", "")
+        for row in vswitches.values()
+        if (row.get("vswitch_id") or row.get("resource_id")) and row.get("vpc_id")
+    }
+
+    resource_to_vpc: dict[str, str] = {}
+
+    def register_vpc(resource_id: str, vpc_id: str) -> None:
+        if resource_id and vpc_id:
+            resource_to_vpc[resource_id] = vpc_id
+
+    for instance_id, vpc_id in instance_to_vpc.items():
+        register_vpc(instance_id, vpc_id)
+    for row in details.vpc_nat_gateways:
+        register_vpc(row.get("nat_gateway_id", ""), row.get("vpc_id", ""))
+    for row in details.vpc_vpn_gateways:
+        register_vpc(row.get("vpn_gateway_id", ""), row.get("vpc_id", ""))
+    for row in details.slb_load_balancers + details.alb_load_balancers + details.nlb_load_balancers:
+        register_vpc(row.get("load_balancer_id", ""), row.get("vpc_id", ""))
+    for row in details.alb_server_groups + details.nlb_server_groups:
+        register_vpc(row.get("server_group_id", ""), row.get("vpc_id", ""))
+    for row in details.rds_instances + details.redis_instances:
+        register_vpc(row.get("instance_id", ""), row.get("vpc_id", ""))
+
+    def resolve_vpc_id(row: dict[str, str]) -> str:
+        if row.get("vpc_id"):
+            return row["vpc_id"]
+        vswitch_id = row.get("vswitch_id", "")
+        if vswitch_id and vswitch_to_vpc.get(vswitch_id):
+            return vswitch_to_vpc[vswitch_id]
+        for key in (
+            "instance_id",
+            "associated_instance_id",
+            "bind_resource_id",
+            "load_balancer_id",
+            "server_group_id",
+            "vpn_gateway_id",
+            "server_id",
+            "resource_id",
+        ):
+            target_id = row.get(key, "")
+            if target_id and resource_to_vpc.get(target_id):
+                return resource_to_vpc[target_id]
+        for target_id in split_ids(row.get("server_group_ids", "")):
+            if resource_to_vpc.get(target_id):
+                return resource_to_vpc[target_id]
+        return ""
+
+    def resolve_vswitch_id(row: dict[str, str]) -> str:
+        if row.get("vswitch_id"):
+            return row["vswitch_id"]
+        for key in ("instance_id", "server_id", "resource_id"):
+            target_id = row.get(key, "")
+            if target_id and instance_to_vswitch.get(target_id):
+                return instance_to_vswitch[target_id]
+        return ""
+
+    def add_row_to_bucket(
+        groups: dict[str, dict[str, Any]],
+        unassigned: dict[str, Any],
+        kind: str,
+        row: dict[str, str],
+        *,
+        resource_keys: tuple[str, ...],
+    ) -> None:
+        resolved_vpc_id = resolve_vpc_id(row)
+        resolved_vswitch_id = resolve_vswitch_id(row)
+        enriched = dict(row)
+        enriched["_topology_vpc_id"] = resolved_vpc_id
+        enriched["_topology_vswitch_id"] = resolved_vswitch_id
+        if not resolved_vpc_id:
+            add_bucket_row(unassigned, kind, enriched, resource_keys=resource_keys)
+            return
+        bucket = groups.setdefault(resolved_vpc_id, build_vpc_bucket(raw_vpcs.get(resolved_vpc_id)))
+        if not bucket.get("vpc") and raw_vpcs.get(resolved_vpc_id):
+            bucket["vpc"] = raw_vpcs[resolved_vpc_id]
+        add_bucket_row(bucket, kind, enriched, resource_keys=resource_keys)
+
+    groups = {
+        vpc_id: build_vpc_bucket(row)
+        for vpc_id, row in sorted(raw_vpcs.items(), key=lambda item: (item[1].get("region_id", ""), item[0]))
+    }
+    unassigned = build_vpc_bucket()
+
+    for row in sorted(vswitches.values(), key=lambda item: (item.get("region_id", ""), item.get("vswitch_id", item.get("resource_id", "")))):
+        add_row_to_bucket(groups, unassigned, "vswitches", row, resource_keys=("vswitch_id",))
+
+    for row in details.ecs_instances:
+        add_row_to_bucket(groups, unassigned, "ecs", row, resource_keys=("instance_id",))
+    for row in details.ecs_network_interfaces:
+        add_row_to_bucket(groups, unassigned, "enis", row, resource_keys=("network_interface_id", "instance_id"))
+    for row in details.vpc_eips:
+        add_row_to_bucket(groups, unassigned, "eips", row, resource_keys=("allocation_id", "instance_id", "associated_instance_id", "bind_resource_id"))
+    for row in details.vpc_nat_gateways:
+        add_row_to_bucket(groups, unassigned, "nats", row, resource_keys=("nat_gateway_id",))
+    for row in details.vpc_vpn_gateways:
+        add_row_to_bucket(groups, unassigned, "vpn_gateways", row, resource_keys=("vpn_gateway_id",))
+    for row in details.vpc_vpn_connections:
+        add_row_to_bucket(groups, unassigned, "vpn_connections", row, resource_keys=("vpn_connection_id", "vpn_gateway_id"))
+    for row in details.vpc_ssl_vpn_servers:
+        add_row_to_bucket(groups, unassigned, "ssl_vpn_servers", row, resource_keys=("ssl_vpn_server_id", "vpn_gateway_id"))
+    for service_code, rows in (
+        ("slb", details.slb_load_balancers),
+        ("alb", details.alb_load_balancers),
+        ("nlb", details.nlb_load_balancers),
+    ):
+        for row in rows:
+            add_row_to_bucket(
+                groups,
+                unassigned,
+                "lbs",
+                {**row, "service_code": service_code},
+                resource_keys=("load_balancer_id",),
+            )
+    for service_code, rows in (
+        ("slb", details.slb_listeners),
+        ("alb", details.alb_listeners),
+        ("nlb", details.nlb_listeners),
+    ):
+        for row in rows:
+            add_row_to_bucket(
+                groups,
+                unassigned,
+                "listeners",
+                {**row, "service_code": service_code},
+                resource_keys=("listener_id", "load_balancer_id"),
+            )
+    for service_code, rows in (("alb", details.alb_server_groups), ("nlb", details.nlb_server_groups)):
+        for row in rows:
+            add_row_to_bucket(
+                groups,
+                unassigned,
+                "server_groups",
+                {**row, "service_code": service_code},
+                resource_keys=("server_group_id", "load_balancer_id"),
+            )
+    for service_code, rows in (
+        ("alb", details.alb_server_group_servers),
+        ("nlb", details.nlb_server_group_servers),
+    ):
+        for row in rows:
+            add_row_to_bucket(
+                groups,
+                unassigned,
+                "server_group_servers",
+                {**row, "service_code": service_code},
+                resource_keys=("server_group_id", "server_id"),
+            )
+
+    def build_database_row(
+        row: dict[str, str],
+        service_code: str,
+        net_infos_by_instance: dict[str, list[dict[str, str]]],
+    ) -> dict[str, str]:
+        net_infos = net_infos_by_instance.get(row.get("instance_id", ""), [])
+        vpc_candidates = sorted({resolve_vpc_id(item) for item in net_infos if resolve_vpc_id(item)})
+        vswitch_candidates = sorted({resolve_vswitch_id(item) for item in net_infos if resolve_vswitch_id(item)})
+        endpoint_values = []
+        for item in net_infos:
+            endpoint = item.get("connection_string", "")
+            if item.get("port"):
+                endpoint = f"{endpoint}:{item['port']}" if endpoint else item["port"]
+            if endpoint:
+                endpoint_values.append(endpoint)
+        endpoint_summary = "; ".join(endpoint_values[:2])
+        if len(endpoint_values) > 2:
+            endpoint_summary = f"{endpoint_summary} 等{len(endpoint_values)}个地址"
+        return {
+            **row,
+            "service_code": service_code,
+            "vpc_id": row.get("vpc_id", "") or (vpc_candidates[0] if len(vpc_candidates) == 1 else ""),
+            "vswitch_id": row.get("vswitch_id", "") or (vswitch_candidates[0] if len(vswitch_candidates) == 1 else ""),
+            "endpoint_summary": endpoint_summary,
+        }
+
+    for row in details.rds_instances:
+        add_row_to_bucket(
+            groups,
+            unassigned,
+            "rds",
+            build_database_row(row, "rds", rds_net_infos_by_instance),
+            resource_keys=("instance_id",),
+        )
+    for row in details.redis_instances:
+        add_row_to_bucket(
+            groups,
+            unassigned,
+            "redis",
+            build_database_row(row, "redis", redis_net_infos_by_instance),
+            resource_keys=("instance_id",),
+        )
+
+    def render_bucket_markdown(
+        title: str,
+        root_label: str,
+        bucket: dict[str, Any],
+        events: list[dict[str, str]],
+    ) -> str:
+        root_node = mermaid_node_id("topology_root", root_label)
+        root_nodes: dict[str, str] = {}
+        root_node_ids: list[str] = []
+        subgraphs: dict[str, dict[str, Any]] = {}
+        resource_nodes: dict[str, str] = {}
+        edges: list[str] = []
+        edge_seen: set[tuple[str, str]] = set()
+        incoming: set[str] = set()
+
+        def add_edge(src: str, dst: str) -> None:
+            key = (src, dst)
+            if not src or not dst or key in edge_seen:
+                return
+            edge_seen.add(key)
+            incoming.add(dst)
+            edges.append(f"  {src} --> {dst}")
+
+        def add_root_node(node_id: str, label: str) -> None:
+            if node_id not in root_nodes:
+                root_nodes[node_id] = f'{node_id}["{label}"]'
+                root_node_ids.append(node_id)
+
+        def add_subgraph_node(vswitch_id: str, node_id: str, label: str) -> None:
+            subgraph = subgraphs[vswitch_id]
+            if node_id not in subgraph["nodes"]:
+                subgraph["nodes"][node_id] = f'{node_id}["{label}"]'
+
+        def register_resource_node(node_id: str, row: dict[str, str], *keys: str) -> None:
+            for key in keys:
+                value = row.get(key, "")
+                if value:
+                    resource_nodes[value] = node_id
+
+        def ensure_vswitch_anchor(row: dict[str, str]) -> str:
+            vswitch_id = row.get("vswitch_id") or row.get("resource_id", "")
+            if vswitch_id in subgraphs:
+                return subgraphs[vswitch_id]["anchor_id"]
+            label_parts = [
+                "VSwitch",
+                resource_display_name(row, ("resource_name",), ("vswitch_id", "resource_id")),
+            ]
+            if row.get("cidr_block"):
+                label_parts.append(row["cidr_block"])
+            if row.get("zone_id"):
+                label_parts.append(row["zone_id"])
+            anchor_id = mermaid_node_id("vsw", row.get("region_id", ""), vswitch_id)
+            subgraphs[vswitch_id] = {
+                "title": mermaid_label(
+                    resource_display_name(row, ("resource_name",), ("vswitch_id", "resource_id")),
+                    row.get("zone_id", ""),
+                ),
+                "anchor_id": anchor_id,
+                "nodes": {},
+            }
+            add_subgraph_node(vswitch_id, anchor_id, mermaid_label(*label_parts))
+            register_resource_node(anchor_id, row, "vswitch_id", "resource_id")
+            add_edge(root_node, anchor_id)
+            return anchor_id
+
+        def attach_node(node_id: str, label: str, row: dict[str, str], *keys: str) -> None:
+            vswitch_id = row.get("_topology_vswitch_id", "")
+            if vswitch_id and vswitch_id in subgraphs:
+                add_subgraph_node(vswitch_id, node_id, label)
+                register_resource_node(node_id, row, *keys)
+                add_edge(subgraphs[vswitch_id]["anchor_id"], node_id)
+                return
+            add_root_node(node_id, label)
+            register_resource_node(node_id, row, *keys)
+
+        add_root_node(root_node, mermaid_label(root_label))
+
+        for row in bucket["vswitches"]:
+            ensure_vswitch_anchor(row)
+
+        for row in bucket["ecs"]:
+            name = resource_display_name(row, ("instance_name",), ("instance_id",))
+            node_id = mermaid_node_id("ecs", row.get("region_id", ""), row.get("instance_id", ""))
+            label_parts = ["ECS", name, row.get("instance_id", "")]
+            if row.get("private_ip"):
+                label_parts.append(f"私网: {row['private_ip']}")
+            if row.get("public_ip"):
+                label_parts.append(f"公网: {row['public_ip']}")
+            if row.get("eip"):
+                label_parts.append(f"EIP: {row['eip']}")
+            security_groups = summarize_security_groups(row.get("security_group_ids", ""))
+            if security_groups:
+                label_parts.append(f"安全组: {security_groups}")
+            attach_node(node_id, mermaid_label(*label_parts), row, "instance_id", "resource_id")
+
+        for row in bucket["enis"]:
+            instance_id = row.get("instance_id", "")
+            if instance_id and resource_nodes.get(instance_id):
+                continue
+            node_id = mermaid_node_id("eni", row.get("region_id", ""), row.get("network_interface_id", ""))
+            label_parts = [
+                "ENI",
+                resource_display_name(row, ("name",), ("network_interface_id", "resource_id")),
+                row.get("network_interface_id", ""),
+            ]
+            if row.get("private_ip"):
+                label_parts.append(f"私网: {row['private_ip']}")
+            if row.get("status"):
+                label_parts.append(f"状态: {row['status']}")
+            attach_node(node_id, mermaid_label(*label_parts), row, "network_interface_id", "resource_id")
+
+        for row in bucket["rds"] + bucket["redis"]:
+            service_name = "RDS" if row.get("service_code") == "rds" else "Redis"
+            node_id = mermaid_node_id(row.get("service_code", "db"), row.get("region_id", ""), row.get("instance_id", ""))
+            label_parts = [
+                service_name,
+                resource_display_name(row, ("resource_name",), ("instance_id", "resource_id")),
+                row.get("instance_id", ""),
+            ]
+            engine = " ".join(part for part in (row.get("engine", ""), row.get("engine_version", "")) if part)
+            if engine:
+                label_parts.append(engine)
+            if row.get("endpoint_summary"):
+                label_parts.append(row["endpoint_summary"])
+            attach_node(node_id, mermaid_label(*label_parts), row, "instance_id", "resource_id")
+
+        for row in bucket["nats"]:
+            node_id = mermaid_node_id("nat", row.get("region_id", ""), row.get("nat_gateway_id", ""))
+            label_parts = [
+                "NAT",
+                resource_display_name(row, ("resource_name",), ("nat_gateway_id", "resource_id")),
+                row.get("nat_gateway_id", ""),
+            ]
+            if row.get("spec"):
+                label_parts.append(f"规格: {row['spec']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "nat_gateway_id", "resource_id")
+
+        for row in bucket["vpn_gateways"]:
+            node_id = mermaid_node_id("vpn_gw", row.get("region_id", ""), row.get("vpn_gateway_id", ""))
+            label_parts = [
+                "VPN Gateway",
+                resource_display_name(row, ("resource_name",), ("vpn_gateway_id", "resource_id")),
+                row.get("vpn_gateway_id", ""),
+            ]
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "vpn_gateway_id", "resource_id")
+
+        for row in bucket["lbs"]:
+            service_name = row.get("service_code", "").upper() or "LB"
+            node_id = mermaid_node_id("lb", row.get("service_code", ""), row.get("region_id", ""), row.get("load_balancer_id", ""))
+            label_parts = [
+                service_name,
+                resource_display_name(row, ("load_balancer_name", "resource_name"), ("load_balancer_id", "resource_id")),
+                row.get("load_balancer_id", ""),
+            ]
+            if row.get("address"):
+                label_parts.append(row["address"])
+            if row.get("address_type"):
+                label_parts.append(f"地址类型: {row['address_type']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "load_balancer_id", "resource_id")
+
+        for row in bucket["server_groups"]:
+            node_id = mermaid_node_id("sgroup", row.get("service_code", ""), row.get("region_id", ""), row.get("server_group_id", ""))
+            label_parts = [
+                "ServerGroup",
+                resource_display_name(row, ("server_group_name", "resource_name"), ("server_group_id", "resource_id")),
+                row.get("server_group_id", ""),
+            ]
+            protocol = " / ".join(part for part in (row.get("server_group_type", ""), row.get("protocol", "")) if part)
+            if protocol:
+                label_parts.append(protocol)
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "server_group_id", "resource_id")
+
+        for row in bucket["listeners"]:
+            node_id = mermaid_node_id("listener", row.get("service_code", ""), row.get("region_id", ""), row.get("listener_id", row.get("load_balancer_id", "")))
+            label_parts = [row.get("service_code", "").upper() + " Listener"]
+            protocol = row.get("protocol", "")
+            port = row.get("port", "")
+            if protocol or port:
+                label_parts.append("/".join(part for part in (protocol, port) if part))
+            if row.get("status"):
+                label_parts.append(f"状态: {row['status']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "listener_id", "resource_id")
+            parent_id = resource_nodes.get(row.get("load_balancer_id", ""), "")
+            if parent_id:
+                add_edge(parent_id, node_id)
+            for server_group_id in split_ids(row.get("server_group_ids", "")):
+                target_id = resource_nodes.get(server_group_id, "")
+                if target_id:
+                    add_edge(node_id, target_id)
+
+        for row in bucket["server_group_servers"]:
+            group_node_id = resource_nodes.get(row.get("server_group_id", ""), "")
+            if not group_node_id:
+                continue
+            target_id = resource_nodes.get(row.get("server_id", ""), "")
+            if target_id:
+                add_edge(group_node_id, target_id)
+                continue
+            node_id = mermaid_node_id("backend", row.get("service_code", ""), row.get("region_id", ""), row.get("server_id", row.get("resource_id", "")))
+            label_parts = ["Backend", row.get("server_id", "") or row.get("resource_id", "")]
+            if row.get("port"):
+                label_parts.append(f"端口: {row['port']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "server_id", "resource_id")
+            add_edge(group_node_id, node_id)
+
+        for row in bucket["eips"]:
+            node_id = mermaid_node_id("eip", row.get("region_id", ""), row.get("allocation_id", ""))
+            label_parts = ["EIP", row.get("ip_address", ""), row.get("allocation_id", "")]
+            if row.get("status"):
+                label_parts.append(f"状态: {row['status']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "allocation_id", "resource_id")
+            for key in ("instance_id", "associated_instance_id", "bind_resource_id"):
+                target_id = resource_nodes.get(row.get(key, ""), "")
+                if target_id:
+                    add_edge(node_id, target_id)
+                    break
+
+        for row in bucket["vpn_connections"]:
+            parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
+            node_id = mermaid_node_id("vpn_conn", row.get("region_id", ""), row.get("vpn_connection_id", ""))
+            label_parts = [
+                "VPN Connection",
+                resource_display_name(row, ("resource_name",), ("vpn_connection_id", "resource_id")),
+                row.get("vpn_connection_id", ""),
+            ]
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "vpn_connection_id", "resource_id")
+            if parent_id:
+                add_edge(parent_id, node_id)
+
+        for row in bucket["ssl_vpn_servers"]:
+            parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
+            node_id = mermaid_node_id("ssl_vpn", row.get("region_id", ""), row.get("ssl_vpn_server_id", ""))
+            label_parts = [
+                "SSL-VPN",
+                resource_display_name(row, ("resource_name",), ("ssl_vpn_server_id", "resource_id")),
+                row.get("ssl_vpn_server_id", ""),
+            ]
+            if row.get("internet_ip"):
+                label_parts.append(f"公网: {row['internet_ip']}")
+            add_root_node(node_id, mermaid_label(*label_parts))
+            register_resource_node(node_id, row, "ssl_vpn_server_id", "resource_id")
+            if parent_id:
+                add_edge(parent_id, node_id)
+
+        for node_id in root_node_ids:
+            if node_id != root_node and node_id not in incoming:
+                add_edge(root_node, node_id)
+
+        mermaid_lines = ["```mermaid", "flowchart LR"]
+        for node_id, definition in root_nodes.items():
+            mermaid_lines.append(f"  {definition}")
+        for vswitch_id in sorted(subgraphs, key=lambda item: (subgraphs[item]["title"], item)):
+            mermaid_lines.append(
+                f'  subgraph {mermaid_node_id("subgraph", vswitch_id)}["{subgraphs[vswitch_id]["title"]}"]'
+            )
+            mermaid_lines.append("    direction TB")
+            for definition in subgraphs[vswitch_id]["nodes"].values():
+                mermaid_lines.append(f"    {definition}")
+            mermaid_lines.append("  end")
+        mermaid_lines.extend(edges)
+        mermaid_lines.append("```")
+
+        lines = [
+            f"# {title}",
+            "",
+            "- 说明：仅根据显式字段和确定性映射生成资源关系拓扑，不表示真实访问路径。",
+        ]
+        if events:
+            lines.extend(
+                [
+                    "",
+                    "> 检测到部分关系缺失，相关接口失败如下：",
+                    *[
+                        f"> - {row.get('service', '')} / {row.get('api', '')} / {row.get('message', '')}"
+                        for row in events
+                    ],
+                ]
+            )
+        lines.extend(["", *mermaid_lines, ""])
+        return "\n".join(lines).rstrip() + "\n"
+
+    docs: dict[str, str] = {}
+    topology_entries: list[tuple[str, str, str]] = []
+    for vpc_id, bucket in sorted(groups.items(), key=lambda item: (item[1].get("vpc", {}).get("region_id", ""), item[0])):
+        vpc_row = bucket.get("vpc", {})
+        region_id = vpc_row.get("region_id", "")
+        vpc_name = resource_display_name(vpc_row, ("resource_name",), ("resource_id",)) if vpc_row else vpc_id
+        title = f"{region_id or 'unknown'} / {vpc_name} / {vpc_id}"
+        filename = f"{safe_dirname(region_id or 'unknown')}__{safe_dirname(vpc_id)}.md"
+        events = topology_collection_events(details, region_id=region_id, resource_ids=bucket["resource_ids"])
+        docs[filename] = render_bucket_markdown(
+            f"网络拓扑：{title}",
+            mermaid_label("VPC", vpc_name, vpc_id),
+            bucket,
+            events,
+        )
+        topology_entries.append((filename, title, str(len(bucket["resource_ids"]))))
+
+    unassigned_events = topology_collection_events(details, resource_ids=unassigned["resource_ids"])
+    docs["unassigned.md"] = render_bucket_markdown(
+        "网络拓扑：未归属资源",
+        mermaid_label("未归属 VPC 的资源", subscription),
+        unassigned,
+        unassigned_events,
+    )
+
+    readme_lines = [
+        "# 网络拓扑文件",
+        "",
+        "- 说明：每个 `VPC` 单独输出一份 `Mermaid` 拓扑图，只展示显式字段和确定性映射能确认的关系。",
+        "- 边界：不按名称、同地域或同标签猜测依赖关系；未能确认 `VPC` 归属的资源会写入 `unassigned.md`。",
+        "",
+        "## 文件列表",
+    ]
+    if topology_entries:
+        readme_lines.extend(
+            f"- [{filename}](./{filename})：{title}，资源ID数={count}"
+            for filename, title, count in topology_entries
+        )
+    else:
+        readme_lines.append("- 当前未识别到 VPC 资源。")
+    readme_lines.append(
+        f"- [unassigned.md](./unassigned.md)：未能确认 VPC 归属的资源，资源ID数={len(unassigned['resource_ids'])}"
+    )
+    readme_lines.append("")
+    docs["README.md"] = "\n".join(readme_lines)
+    return docs
+
+
+def write_topology_documents(path: Path, documents: dict[str, str]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for filename, content in documents.items():
+        write_text(path / filename, content)
 
 
 def build_report_sheets(
@@ -3437,6 +4456,7 @@ def verify_permissions(args: argparse.Namespace, subscription: Subscription) -> 
     failed = 0
     print(f"[权限验证] 开始 订阅={subscription.label}")
     for check in VERIFY_CHECKS:
+        error_detail = ""
         try:
             run_aliyun(
                 check["args"],
@@ -3449,6 +4469,11 @@ def verify_permissions(args: argparse.Namespace, subscription: Subscription) -> 
         except AliyunCliError as exc:
             allowed = False
             denied = looks_access_denied(exc)
+            error_detail = str(exc)
+        except subprocess.TimeoutExpired as exc:
+            allowed = False
+            denied = False
+            error_detail = f"执行超时，命令在 {exc.timeout} 秒内未返回"
 
         expect = check["expect"]
         ok = (expect == "allow" and allowed) or (expect == "deny" and denied)
@@ -3456,9 +4481,10 @@ def verify_permissions(args: argparse.Namespace, subscription: Subscription) -> 
         if not ok:
             failed += 1
         expected_text = "允许" if expect == "allow" else "拒绝"
+        detail_suffix = f" 原因={error_detail}" if error_detail and not ok else ""
         print(
             f"[权限验证] {status} 订阅={subscription.label} "
-            f"预期={expected_text} 检查项={check['name']}"
+            f"预期={expected_text} 检查项={check['name']}{detail_suffix}"
         )
 
     return failed
@@ -3728,6 +4754,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="不输出 Excel 报告工作簿",
     )
+    topology_group = parser.add_mutually_exclusive_group()
+    topology_group.add_argument(
+        "--topology",
+        dest="topology",
+        action="store_true",
+        default=True,
+        help="显式开启按 VPC 输出 Mermaid 网络拓扑 Markdown 文件（默认开启）",
+    )
+    topology_group.add_argument(
+        "--no-topology",
+        dest="topology",
+        action="store_false",
+        help="不输出 Mermaid 网络拓扑 Markdown 文件",
+    )
     parser.add_argument(
         "--no-detail",
         action="store_true",
@@ -3836,7 +4876,9 @@ def main() -> int:
             raise ValueError("--findings-output 只能在单订阅导出时使用")
         if args.no_checks and args.checks_only:
             raise ValueError("--no-checks 和 --checks-only 不能同时使用")
-        if args.no_raw_csv and args.no_report and checks_config is None:
+        if args.topology and args.no_detail:
+            raise ValueError("默认启用拓扑，--no-detail 需要配合 --no-topology 使用")
+        if args.no_raw_csv and args.no_report and checks_config is None and not args.topology:
             raise ValueError("--no-raw-csv 和 --no-report 不能同时使用")
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"[错误] {exc}", file=sys.stderr)
@@ -3915,6 +4957,14 @@ def main() -> int:
                 )
             else:
                 report_path = None
+            if args.topology:
+                topology_path = topology_dir_for(args, subscription, len(subscriptions))
+                write_topology_documents(
+                    topology_path,
+                    build_topology_documents(rows, details),
+                )
+            else:
+                topology_path = None
         except (AliyunCliError, ValueError, subprocess.TimeoutExpired) as exc:
             print(
                 f"[资产梳理] 失败 订阅={subscription.label} 错误={exc}",
@@ -3933,6 +4983,8 @@ def main() -> int:
             outputs.append(f"巡检CSV={findings_path}")
         if report_path:
             outputs.append(f"报告={report_path}")
+        if topology_path:
+            outputs.append(f"拓扑={topology_path}")
         print(f"[资产梳理] 已导出={len(rows)} 订阅={subscription.label} {' '.join(outputs)}")
 
     if not args.verify_only and len(subscriptions) > 1 and not args.no_combined:

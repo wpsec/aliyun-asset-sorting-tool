@@ -42,6 +42,7 @@ def make_details(**overrides):
         "ecs_snapshot_policy_associations": [],
         "rds_instances": [],
         "rds_net_infos": [],
+        "rds_ip_arrays": [],
         "redis_instances": [],
         "redis_net_infos": [],
         "metric_summaries": [],
@@ -118,6 +119,52 @@ class CheckRulesTest(unittest.TestCase):
         matched = [item for item in findings if item.check_id == "ecs_high_risk_security_group_rule"]
         self.assertEqual("high", matched[0].severity)
 
+    def test_public_icmp_security_group_rule_is_not_high_risk(self):
+        findings = run_with(
+            make_details(
+                ecs_security_group_rules=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "cn-shanghai",
+                        "security_group_id": "sg-001",
+                        "source_cidr_ip": "0.0.0.0/0",
+                        "port_range": "-1/-1",
+                        "policy": "Accept",
+                        "direction": "ingress",
+                        "ip_protocol": "icmp",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn(
+            "ecs_high_risk_security_group_rule",
+            {item.check_id for item in findings},
+        )
+
+    def test_trusted_internal_security_group_rule_is_not_high_risk(self):
+        findings = run_with(
+            make_details(
+                ecs_security_group_rules=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "cn-shanghai",
+                        "security_group_id": "sg-001",
+                        "source_cidr_ip": "192.168.20.0/23",
+                        "port_range": "22/22",
+                        "policy": "Accept",
+                        "direction": "ingress",
+                        "ip_protocol": "tcp",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn(
+            "ecs_high_risk_security_group_rule",
+            {item.check_id for item in findings},
+        )
+
     def test_stale_access_key(self):
         findings = run_with(
             make_details(
@@ -136,6 +183,109 @@ class CheckRulesTest(unittest.TestCase):
             )
         )
         self.assertIn("ram_stale_access_key", {item.check_id for item in findings})
+
+    def test_public_rds_endpoint_without_whitelist_is_reported(self):
+        findings = run_with(
+            make_details(
+                rds_net_infos=[
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "net_type": "Public",
+                        "connection_string": "pgm-001fo.pg.rds.aliyuncs.com",
+                        "port": "5432",
+                    }
+                ]
+            )
+        )
+        self.assertIn("rds_public_endpoint", {item.check_id for item in findings})
+
+    def test_public_rds_endpoint_with_restricted_whitelist_is_not_reported(self):
+        findings = run_with(
+            make_details(
+                rds_net_infos=[
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "net_type": "Public",
+                        "connection_string": "pgm-001fo.pg.rds.aliyuncs.com",
+                        "port": "5432",
+                    }
+                ],
+                rds_ip_arrays=[
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "whitelist_name": "default",
+                        "whitelist_attribute": "",
+                        "security_ip_list": "172.16.15.0/24",
+                        "security_ip_type": "IPv4",
+                    },
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "whitelist_name": "eyti_office",
+                        "whitelist_attribute": "",
+                        "security_ip_list": "58.246.209.211",
+                        "security_ip_type": "IPv4",
+                    },
+                ],
+            )
+        )
+        self.assertNotIn(
+            "rds_public_endpoint",
+            {item.check_id for item in findings},
+        )
+
+    def test_public_rds_endpoint_with_open_whitelist_is_reported(self):
+        findings = run_with(
+            make_details(
+                rds_net_infos=[
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "net_type": "Public",
+                        "connection_string": "pgm-001fo.pg.rds.aliyuncs.com",
+                        "port": "5432",
+                    }
+                ],
+                rds_ip_arrays=[
+                    {
+                        "subscription": "uat",
+                        "account_id": "1671544939861873",
+                        "region_id": "cn-shanghai",
+                        "instance_id": "pgm-001",
+                        "resource_id": "pgm-001",
+                        "resource_name": "ctp-uat-pgsql",
+                        "whitelist_name": "default",
+                        "whitelist_attribute": "",
+                        "security_ip_list": "0.0.0.0/0",
+                        "security_ip_type": "IPv4",
+                    }
+                ],
+            )
+        )
+        self.assertIn("rds_public_endpoint", {item.check_id for item in findings})
 
     def test_normal_resources_have_no_findings(self):
         findings = run_with(

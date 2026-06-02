@@ -133,6 +133,8 @@ def check_high_risk_security_group_rules(context: CheckContext) -> list[CheckFin
         source = rule.get("source_cidr_ip") or rule.get("ipv6_source_cidr_ip")
         if source not in {"0.0.0.0/0", "::/0"}:
             continue
+        if not protocol_supports_port_range(rule.get("ip_protocol", "")):
+            continue
         matched_ports = sorted(
             port for port in high_risk_ports if port_range_contains(rule.get("port_range", ""), port)
         )
@@ -159,6 +161,12 @@ def check_high_risk_security_group_rules(context: CheckContext) -> list[CheckFin
             )
         )
     return findings
+
+
+def protocol_supports_port_range(ip_protocol: str) -> bool:
+    text = str(ip_protocol or "").strip().lower()
+    # 只对端口型协议做高危端口判定，避免把 ICMP 这类非端口协议误判为端口暴露。
+    return text in {"", "tcp", "udp", "all", "sctp"}
 
 
 def port_range_contains(port_range: str, target_port: int) -> bool:

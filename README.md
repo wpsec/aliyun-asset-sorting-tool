@@ -1,6 +1,6 @@
 # 阿里云云资产梳理工具
 
-本项目用于通过阿里云 RAM 只读策略和 `aliyun` CLI 梳理云资产，默认输出原始资源中心清单、可交付 Excel 报告，以及 Mermaid 网络拓扑。
+本项目用于通过阿里云 RAM 只读策略和 `aliyun` CLI 梳理云资产，默认输出原始资源中心清单、可交付 Excel 报告，以及 Mermaid 和 draw.io 网络拓扑。
 
 ## 目录结构
 
@@ -131,6 +131,17 @@ python3 aliyun_asset_inventory.py \
   --output-dir outputs/aliyun-assets
 ```
 
+如果还需要 `draw.io` 版拓扑图，可以额外加 `--drawio`。脚本会优先读取项目根目录下的 `alibaba-cloud-icons-main/collections/drawio/Collections.xml` 作为本地图标库，缺失时自动回退为通用节点样式：
+
+```bash
+python3 aliyun_asset_inventory.py \
+  --profile dev \
+  --drawio \
+  --output-dir outputs/aliyun-assets
+```
+
+如果只想输出 `draw.io`，可以再加 `--no-topology`。
+
 输出示例：
 
 ```text
@@ -143,6 +154,10 @@ outputs/aliyun-assets/
 │       ├── README.md
 │       ├── cn-shanghai__vpc-bp1xxxx.md
 │       └── unassigned.md
+│   └── topology-drawio/
+│       ├── README.md
+│       ├── cn-shanghai__vpc-bp1xxxx.drawio
+│       └── unassigned.drawio
 ├── prod/
 │   ├── raw-resourcecenter.csv
 │   ├── findings.csv

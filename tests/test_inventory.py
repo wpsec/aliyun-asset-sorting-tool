@@ -4,6 +4,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 from scripts import aliyun_asset_inventory as inventory
 
@@ -356,6 +357,114 @@ class TopologyRenderingTest(unittest.TestCase):
         self.assertIn("DescribeVSwitches", content)
         self.assertIn("权限不足", content)
 
+    def test_build_topology_drawio_documents_renders_basic_vpc_relationships(self):
+        raw_rows = [
+            raw_row(
+                resource_type="ACS::VPC::VPC",
+                resource_type_name="专有网络",
+                resource_id="vpc-1",
+                resource_name="core-vpc",
+            ),
+            raw_row(
+                resource_type="ACS::VPC::VSwitch",
+                resource_type_name="交换机",
+                resource_id="vsw-1",
+                resource_name="app-vsw",
+                zone_id="cn-shanghai-a",
+            ),
+        ]
+        details = inventory.DetailedAssets(
+            vpc_vswitches=[
+                {
+                    "subscription": "dev",
+                    "account_id": "1234567890",
+                    "region_id": "cn-shanghai",
+                    "zone_id": "cn-shanghai-a",
+                    "vswitch_id": "vsw-1",
+                    "resource_id": "vsw-1",
+                    "resource_name": "app-vsw",
+                    "status": "Available",
+                    "vpc_id": "vpc-1",
+                    "cidr_block": "10.0.1.0/24",
+                    "available_ip_address_count": "250",
+                    "creation_time": "",
+                }
+            ],
+            ecs_instances=[
+                {
+                    "subscription": "dev",
+                    "account_id": "1234567890",
+                    "region_id": "cn-shanghai",
+                    "zone_id": "cn-shanghai-a",
+                    "instance_id": "i-1",
+                    "instance_name": "web-1",
+                    "host_name": "web-1",
+                    "status": "Running",
+                    "instance_type": "ecs.g6.large",
+                    "cpu": "2",
+                    "memory_mb": "4096",
+                    "os_name": "Linux",
+                    "image_id": "img-1",
+                    "vpc_id": "vpc-1",
+                    "vswitch_id": "vsw-1",
+                    "private_ip": "10.0.1.10",
+                    "public_ip": "",
+                    "eip": "",
+                    "security_group_ids": "sg-1;sg-2",
+                    "charge_type": "PostPaid",
+                    "creation_time": "",
+                    "expired_time": "",
+                    "tags": "",
+                }
+            ],
+            vpc_eips=[
+                {
+                    "subscription": "dev",
+                    "account_id": "1234567890",
+                    "region_id": "cn-shanghai",
+                    "allocation_id": "eip-1",
+                    "resource_id": "eip-1",
+                    "resource_name": "public-web",
+                    "ip_address": "1.1.1.1",
+                    "status": "InUse",
+                    "instance_id": "i-1",
+                    "associated_instance_id": "",
+                    "bind_resource_id": "",
+                    "instance_type": "EcsInstance",
+                    "bandwidth": "5",
+                    "charge_type": "PayByTraffic",
+                    "creation_time": "",
+                }
+            ],
+        )
+
+        docs = inventory.build_topology_drawio_documents(raw_rows, details)
+        xml_text = docs["cn-shanghai__vpc-1.drawio"]
+        root = ET.fromstring(xml_text)
+        diagram = root.find("diagram")
+        self.assertIsNotNone(diagram)
+        model = diagram.find("mxGraphModel")
+        self.assertIsNotNone(model)
+        cells = model.findall("./root/mxCell")
+
+        self.assertIn("topology-drawio", docs["README.md"])
+        self.assertIn("unassigned.drawio", docs["README.md"])
+        self.assertTrue(any("core-vpc" in cell.attrib.get("value", "") for cell in cells))
+        self.assertTrue(any("web-1" in cell.attrib.get("value", "") for cell in cells))
+        self.assertTrue(any("eip-1" in cell.attrib.get("value", "") for cell in cells))
+        self.assertTrue(any("image=data:image/svg+xml;base64" in cell.attrib.get("style", "") for cell in cells))
+
+        ecs_cell = next(cell for cell in cells if "web-1" in cell.attrib.get("value", ""))
+        eip_cell = next(cell for cell in cells if "eip-1" in cell.attrib.get("value", ""))
+        edges = [cell for cell in cells if cell.attrib.get("edge") == "1"]
+        self.assertTrue(
+            any(
+                edge.attrib.get("source") == eip_cell.attrib.get("id")
+                and edge.attrib.get("target") == ecs_cell.attrib.get("id")
+                for edge in edges
+            )
+        )
+
 
 class MainValidationTest(unittest.TestCase):
     def test_parse_args_enables_topology_by_default(self):
@@ -363,6 +472,12 @@ class MainValidationTest(unittest.TestCase):
             args = inventory.parse_args()
 
         self.assertTrue(args.topology)
+
+    def test_parse_args_enables_drawio_flag(self):
+        with mock.patch("sys.argv", ["aliyun_asset_inventory.py", "--drawio"]):
+            args = inventory.parse_args()
+
+        self.assertTrue(args.drawio)
 
     def test_main_rejects_topology_with_no_detail(self):
         args = SimpleNamespace(
@@ -391,6 +506,35 @@ class MainValidationTest(unittest.TestCase):
 
         self.assertEqual(2, code)
         self.assertIn("默认启用拓扑，--no-detail 需要配合 --no-topology 使用", captured.getvalue())
+
+    def test_main_rejects_drawio_with_no_detail(self):
+        args = SimpleNamespace(
+            no_checks=True,
+            verify_only=False,
+            checks_config="",
+            severity_threshold="low",
+            output="",
+            report_output="",
+            findings_output="",
+            no_raw_csv=False,
+            no_report=False,
+            topology=False,
+            drawio=True,
+            no_detail=True,
+            checks_only=False,
+        )
+
+        with mock.patch.object(inventory, "parse_args", return_value=args), mock.patch.object(
+            inventory,
+            "collect_subscriptions",
+            return_value=[inventory.Subscription(profile="dev", label="dev")],
+        ):
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                code = inventory.main()
+
+        self.assertEqual(2, code)
+        self.assertIn("--drawio 需要详情采集，不能与 --no-detail 同时使用", captured.getvalue())
 
 
 if __name__ == "__main__":

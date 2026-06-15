@@ -1,5 +1,7 @@
 # draw.io 拓扑图导出开发计划
 
+> 当前进度：首版 draw.io 导出已落地，支持 `--drawio`、`topology-drawio/` 输出，以及本地图标库内嵌回退。
+
 ## 目标
 
 - 在现有 Mermaid 拓扑基础上，新增 `draw.io/.drawio` 导出能力。

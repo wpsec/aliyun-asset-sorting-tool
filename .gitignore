@@ -6,3 +6,4 @@ outputs/*
 .codegraph/
 .vscode/
 alibaba-cloud-icons-main/
+.claude/

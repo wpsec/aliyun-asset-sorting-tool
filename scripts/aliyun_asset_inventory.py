@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import csv
 import dataclasses
 import datetime as dt
@@ -21,7 +20,6 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any
-import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -364,32 +362,6 @@ class TopologyBuckets:
     subscription: str
     groups: dict[str, dict[str, Any]]
     unassigned: dict[str, Any]
-
-
-@dataclasses.dataclass
-class TopologyRenderData:
-    subscription: str
-    title: str
-    root_label: str
-    root_node_id: str
-    nodes: dict[str, TopologyDiagramNode]
-    edges: list[tuple[str, str]]
-    resource_nodes: dict[str, str]
-    events: list[dict[str, str]]
-    group_ids: set[str] = dataclasses.field(default_factory=set)
-
-
-@dataclasses.dataclass
-class TopologyDiagramNode:
-    node_id: str
-    kind: str
-    label_lines: list[str]
-    group_id: str = ""
-    icon_title: str = ""
-    width: int = 180
-    height: int = 96
-    x: int = 0
-    y: int = 0
 
 
 VERIFY_CHECKS = [
@@ -3715,38 +3687,6 @@ def topology_label_lines(*parts: str) -> list[str]:
     return [part for part in parts if part]
 
 
-def default_drawio_icon_file() -> Path:
-    return PROJECT_ROOT / "alibaba-cloud-icons-main" / "collections" / "drawio" / "Collections.xml"
-
-
-@functools.lru_cache(maxsize=2)
-def load_drawio_icon_library(icon_file: str) -> dict[str, str]:
-    path = Path(icon_file)
-    if not path.exists():
-        return {}
-
-    try:
-        root = ET.fromstring(path.read_text(encoding="utf-8"))
-        items = json.loads(root.text or "[]")
-    except (OSError, ET.ParseError, json.JSONDecodeError, ValueError, TypeError):
-        return {}
-
-    icons: dict[str, str] = {}
-    for item in items:
-        title = str(item.get("title", "")).strip()
-        data = str(item.get("data", "")).strip()
-        if title and data:
-            icons[title] = data
-    return icons
-
-
-def drawio_icon_data(icon_titles: tuple[str, ...], icons: dict[str, str]) -> str:
-    for title in icon_titles:
-        if title in icons:
-            return icons[title]
-    return ""
-
-
 def topology_dir_for(
     args: argparse.Namespace,
     subscription: Subscription,
@@ -3757,16 +3697,6 @@ def topology_dir_for(
     return base_dir / safe_dirname(subscription.label) / "topology"
 
 
-def topology_drawio_dir_for(
-    args: argparse.Namespace,
-    subscription: Subscription,
-    subscriptions_count: int,
-) -> Path:
-    del subscriptions_count
-    base_dir = project_path(args.output_dir)
-    return base_dir / safe_dirname(subscription.label) / "topology-drawio"
-
-
 def merge_row(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
     merged = dict(base)
     for key, value in extra.items():
@@ -3775,15 +3705,36 @@ def merge_row(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
     return merged
 
 
-def mermaid_node_id(*parts: str) -> str:
+PLANTUML_KIND = {
+    "root":           ("rectangle", "#E3F2FD"),
+    "vswitch":         ("rectangle", "#C8E6C9"),
+    "ecs":             ("node",      "#ADD8E6"),
+    "eni":             ("node",      "#E0FFFF"),
+    "eip":             ("node",      "#FF00FF"),
+    "nat":             ("rectangle", "#BBDEFB"),
+    "vpn_gateway":     ("rectangle", "#BBDEFB"),
+    "vpn_connection":  ("rectangle", "#BBDEFB"),
+    "ssl_vpn":         ("rectangle", "#BBDEFB"),
+    "lb":              ("rectangle", "#BBDEFB"),
+    "listener":        ("rectangle", "#D3D3D3"),
+    "server_group":    ("rectangle", "#D3D3D3"),
+    "backend":         ("node",      "#ADD8E6"),
+    "rds":             ("database",  "#FFE0B2"),
+    "redis":           ("database",  "#FFCDD2"),
+}
+
+
+def plantuml_alias(*parts: str) -> str:
+    """生成 PlantUML 别名，只保留字母数字和下划线。"""
     joined = "_".join(part for part in parts if part)
     cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", joined).strip("_")
     return cleaned or "node"
 
 
-def mermaid_label(*parts: str) -> str:
-    text = "<br/>".join(topology_label_lines(*parts))
-    return text.replace('"', "'").replace("`", "'")
+def plantuml_label(*parts: str) -> str:
+    """生成 PlantUML 显示标签，多行用 \\n 拼接。"""
+    lines = topology_label_lines(*parts)
+    return "\\n".join(lines).replace('"', "'")
 
 
 def resource_display_name(row: dict[str, str], name_keys: tuple[str, ...], id_keys: tuple[str, ...]) -> str:
@@ -4115,1309 +4066,336 @@ def collect_topology_buckets(
     return TopologyBuckets(subscription=subscription, groups=groups, unassigned=unassigned)
 
 
-def build_topology_documents(
-    raw_rows: list[dict[str, str]],
-    details: DetailedAssets,
-) -> dict[str, str]:
-    subscription = next((row.get("subscription", "") for row in raw_rows if row.get("subscription")), "")
-    raw_vpcs = {
-        row.get("resource_id", ""): row
-        for row in filter_by_resource_type(raw_rows, {"ACS::VPC::VPC"})
-        if row.get("resource_id")
-    }
-    raw_vswitches = {
-        row.get("resource_id", ""): row
-        for row in filter_by_resource_type(raw_rows, {"ACS::VPC::VSwitch"})
-        if row.get("resource_id")
-    }
-    vswitches: dict[str, dict[str, str]] = {}
-    for vswitch_id, row in raw_vswitches.items():
-        vswitches[vswitch_id] = dict(row)
-        vswitches[vswitch_id]["vswitch_id"] = vswitch_id
-    for row in details.vpc_vswitches:
-        vswitch_id = row.get("vswitch_id") or row.get("resource_id")
-        if not vswitch_id:
-            continue
-        existing = vswitches.get(vswitch_id, {})
-        vswitches[vswitch_id] = merge_row(existing, row)
+def _plantuml_node_def(alias: str, kind: str, label: str) -> str:
+    """生成单个 PlantUML 节点定义行。"""
+    element, color = PLANTUML_KIND.get(kind, ("rectangle", ""))
+    color_suffix = f" {color}" if color else ""
+    return f'{element} "{label}" as {alias}{color_suffix}'
 
-    rds_net_infos_by_instance: dict[str, list[dict[str, str]]] = {}
-    for row in details.rds_net_infos:
-        instance_id = row.get("instance_id", "")
-        if instance_id:
-            rds_net_infos_by_instance.setdefault(instance_id, []).append(row)
 
-    redis_net_infos_by_instance: dict[str, list[dict[str, str]]] = {}
-    for row in details.redis_net_infos:
-        instance_id = row.get("instance_id", "")
-        if instance_id:
-            redis_net_infos_by_instance.setdefault(instance_id, []).append(row)
-
-    instance_to_vpc = {
-        row.get("instance_id", ""): row.get("vpc_id", "")
-        for row in details.ecs_instances
-        if row.get("instance_id") and row.get("vpc_id")
-    }
-    instance_to_vswitch = {
-        row.get("instance_id", ""): row.get("vswitch_id", "")
-        for row in details.ecs_instances
-        if row.get("instance_id") and row.get("vswitch_id")
-    }
-    vswitch_to_vpc = {
-        row.get("vswitch_id") or row.get("resource_id", ""): row.get("vpc_id", "")
-        for row in vswitches.values()
-        if (row.get("vswitch_id") or row.get("resource_id")) and row.get("vpc_id")
-    }
-
-    resource_to_vpc: dict[str, str] = {}
-
-    def register_vpc(resource_id: str, vpc_id: str) -> None:
-        if resource_id and vpc_id:
-            resource_to_vpc[resource_id] = vpc_id
-
-    for instance_id, vpc_id in instance_to_vpc.items():
-        register_vpc(instance_id, vpc_id)
-    for row in details.vpc_nat_gateways:
-        register_vpc(row.get("nat_gateway_id", ""), row.get("vpc_id", ""))
-    for row in details.vpc_vpn_gateways:
-        register_vpc(row.get("vpn_gateway_id", ""), row.get("vpc_id", ""))
-    for row in details.slb_load_balancers + details.alb_load_balancers + details.nlb_load_balancers:
-        register_vpc(row.get("load_balancer_id", ""), row.get("vpc_id", ""))
-    for row in details.alb_server_groups + details.nlb_server_groups:
-        register_vpc(row.get("server_group_id", ""), row.get("vpc_id", ""))
-    for row in details.rds_instances + details.redis_instances:
-        register_vpc(row.get("instance_id", ""), row.get("vpc_id", ""))
-
-    def resolve_vpc_id(row: dict[str, str]) -> str:
-        if row.get("vpc_id"):
-            return row["vpc_id"]
-        vswitch_id = row.get("vswitch_id", "")
-        if vswitch_id and vswitch_to_vpc.get(vswitch_id):
-            return vswitch_to_vpc[vswitch_id]
-        for key in (
-            "instance_id",
-            "associated_instance_id",
-            "bind_resource_id",
-            "load_balancer_id",
-            "server_group_id",
-            "vpn_gateway_id",
-            "server_id",
-            "resource_id",
-        ):
-            target_id = row.get(key, "")
-            if target_id and resource_to_vpc.get(target_id):
-                return resource_to_vpc[target_id]
-        for target_id in split_ids(row.get("server_group_ids", "")):
-            if resource_to_vpc.get(target_id):
-                return resource_to_vpc[target_id]
-        return ""
-
-    def resolve_vswitch_id(row: dict[str, str]) -> str:
-        if row.get("vswitch_id"):
-            return row["vswitch_id"]
-        for key in ("instance_id", "server_id", "resource_id"):
-            target_id = row.get(key, "")
-            if target_id and instance_to_vswitch.get(target_id):
-                return instance_to_vswitch[target_id]
-        return ""
-
-    def add_row_to_bucket(
-        groups: dict[str, dict[str, Any]],
-        unassigned: dict[str, Any],
-        kind: str,
-        row: dict[str, str],
-        *,
-        resource_keys: tuple[str, ...],
-    ) -> None:
-        resolved_vpc_id = resolve_vpc_id(row)
-        resolved_vswitch_id = resolve_vswitch_id(row)
-        enriched = dict(row)
-        enriched["_topology_vpc_id"] = resolved_vpc_id
-        enriched["_topology_vswitch_id"] = resolved_vswitch_id
-        if not resolved_vpc_id:
-            add_bucket_row(unassigned, kind, enriched, resource_keys=resource_keys)
-            return
-        bucket = groups.setdefault(resolved_vpc_id, build_vpc_bucket(raw_vpcs.get(resolved_vpc_id)))
-        if not bucket.get("vpc") and raw_vpcs.get(resolved_vpc_id):
-            bucket["vpc"] = raw_vpcs[resolved_vpc_id]
-        add_bucket_row(bucket, kind, enriched, resource_keys=resource_keys)
-
-    groups = {
-        vpc_id: build_vpc_bucket(row)
-        for vpc_id, row in sorted(raw_vpcs.items(), key=lambda item: (item[1].get("region_id", ""), item[0]))
-    }
-    unassigned = build_vpc_bucket()
-
-    for row in sorted(vswitches.values(), key=lambda item: (item.get("region_id", ""), item.get("vswitch_id", item.get("resource_id", "")))):
-        add_row_to_bucket(groups, unassigned, "vswitches", row, resource_keys=("vswitch_id",))
-
-    for row in details.ecs_instances:
-        add_row_to_bucket(groups, unassigned, "ecs", row, resource_keys=("instance_id",))
-    for row in details.ecs_network_interfaces:
-        add_row_to_bucket(groups, unassigned, "enis", row, resource_keys=("network_interface_id", "instance_id"))
-    for row in details.vpc_eips:
-        add_row_to_bucket(groups, unassigned, "eips", row, resource_keys=("allocation_id", "instance_id", "associated_instance_id", "bind_resource_id"))
-    for row in details.vpc_nat_gateways:
-        add_row_to_bucket(groups, unassigned, "nats", row, resource_keys=("nat_gateway_id",))
-    for row in details.vpc_vpn_gateways:
-        add_row_to_bucket(groups, unassigned, "vpn_gateways", row, resource_keys=("vpn_gateway_id",))
-    for row in details.vpc_vpn_connections:
-        add_row_to_bucket(groups, unassigned, "vpn_connections", row, resource_keys=("vpn_connection_id", "vpn_gateway_id"))
-    for row in details.vpc_ssl_vpn_servers:
-        add_row_to_bucket(groups, unassigned, "ssl_vpn_servers", row, resource_keys=("ssl_vpn_server_id", "vpn_gateway_id"))
-    for service_code, rows in (
-        ("slb", details.slb_load_balancers),
-        ("alb", details.alb_load_balancers),
-        ("nlb", details.nlb_load_balancers),
-    ):
-        for row in rows:
-            add_row_to_bucket(
-                groups,
-                unassigned,
-                "lbs",
-                {**row, "service_code": service_code},
-                resource_keys=("load_balancer_id",),
-            )
-    for service_code, rows in (
-        ("slb", details.slb_listeners),
-        ("alb", details.alb_listeners),
-        ("nlb", details.nlb_listeners),
-    ):
-        for row in rows:
-            add_row_to_bucket(
-                groups,
-                unassigned,
-                "listeners",
-                {**row, "service_code": service_code},
-                resource_keys=("listener_id", "load_balancer_id"),
-            )
-    for service_code, rows in (("alb", details.alb_server_groups), ("nlb", details.nlb_server_groups)):
-        for row in rows:
-            add_row_to_bucket(
-                groups,
-                unassigned,
-                "server_groups",
-                {**row, "service_code": service_code},
-                resource_keys=("server_group_id", "load_balancer_id"),
-            )
-    for service_code, rows in (
-        ("alb", details.alb_server_group_servers),
-        ("nlb", details.nlb_server_group_servers),
-    ):
-        for row in rows:
-            add_row_to_bucket(
-                groups,
-                unassigned,
-                "server_group_servers",
-                {**row, "service_code": service_code},
-                resource_keys=("server_group_id", "server_id"),
-            )
-
-    def build_database_row(
-        row: dict[str, str],
-        service_code: str,
-        net_infos_by_instance: dict[str, list[dict[str, str]]],
-    ) -> dict[str, str]:
-        net_infos = net_infos_by_instance.get(row.get("instance_id", ""), [])
-        vpc_candidates = sorted({resolve_vpc_id(item) for item in net_infos if resolve_vpc_id(item)})
-        vswitch_candidates = sorted({resolve_vswitch_id(item) for item in net_infos if resolve_vswitch_id(item)})
-        endpoint_values = []
-        for item in net_infos:
-            endpoint = item.get("connection_string", "")
-            if item.get("port"):
-                endpoint = f"{endpoint}:{item['port']}" if endpoint else item["port"]
-            if endpoint:
-                endpoint_values.append(endpoint)
-        endpoint_summary = "; ".join(endpoint_values[:2])
-        if len(endpoint_values) > 2:
-            endpoint_summary = f"{endpoint_summary} 等{len(endpoint_values)}个地址"
-        return {
-            **row,
-            "service_code": service_code,
-            "vpc_id": row.get("vpc_id", "") or (vpc_candidates[0] if len(vpc_candidates) == 1 else ""),
-            "vswitch_id": row.get("vswitch_id", "") or (vswitch_candidates[0] if len(vswitch_candidates) == 1 else ""),
-            "endpoint_summary": endpoint_summary,
-        }
-
-    for row in details.rds_instances:
-        add_row_to_bucket(
-            groups,
-            unassigned,
-            "rds",
-            build_database_row(row, "rds", rds_net_infos_by_instance),
-            resource_keys=("instance_id",),
-        )
-    for row in details.redis_instances:
-        add_row_to_bucket(
-            groups,
-            unassigned,
-            "redis",
-            build_database_row(row, "redis", redis_net_infos_by_instance),
-            resource_keys=("instance_id",),
-        )
-
-    def render_bucket_markdown(
-        title: str,
-        root_label: str,
-        bucket: dict[str, Any],
-        events: list[dict[str, str]],
-    ) -> str:
-        root_node = mermaid_node_id("topology_root", root_label)
-        root_nodes: dict[str, str] = {}
-        root_node_ids: list[str] = []
-        subgraphs: dict[str, dict[str, Any]] = {}
-        resource_nodes: dict[str, str] = {}
-        edges: list[str] = []
-        edge_seen: set[tuple[str, str]] = set()
-        incoming: set[str] = set()
-
-        def add_edge(src: str, dst: str) -> None:
-            key = (src, dst)
-            if not src or not dst or key in edge_seen:
-                return
-            edge_seen.add(key)
-            incoming.add(dst)
-            edges.append(f"  {src} --> {dst}")
-
-        def add_root_node(node_id: str, label: str) -> None:
-            if node_id not in root_nodes:
-                root_nodes[node_id] = f'{node_id}["{label}"]'
-                root_node_ids.append(node_id)
-
-        def add_subgraph_node(vswitch_id: str, node_id: str, label: str) -> None:
-            subgraph = subgraphs[vswitch_id]
-            if node_id not in subgraph["nodes"]:
-                subgraph["nodes"][node_id] = f'{node_id}["{label}"]'
-
-        def register_resource_node(node_id: str, row: dict[str, str], *keys: str) -> None:
-            for key in keys:
-                value = row.get(key, "")
-                if value:
-                    resource_nodes[value] = node_id
-
-        def ensure_vswitch_anchor(row: dict[str, str]) -> str:
-            vswitch_id = row.get("vswitch_id") or row.get("resource_id", "")
-            if vswitch_id in subgraphs:
-                return subgraphs[vswitch_id]["anchor_id"]
-            label_parts = [
-                "VSwitch",
-                resource_display_name(row, ("resource_name",), ("vswitch_id", "resource_id")),
-            ]
-            if row.get("cidr_block"):
-                label_parts.append(row["cidr_block"])
-            if row.get("zone_id"):
-                label_parts.append(row["zone_id"])
-            anchor_id = mermaid_node_id("vsw", row.get("region_id", ""), vswitch_id)
-            subgraphs[vswitch_id] = {
-                "title": mermaid_label(
-                    resource_display_name(row, ("resource_name",), ("vswitch_id", "resource_id")),
-                    row.get("zone_id", ""),
-                ),
-                "anchor_id": anchor_id,
-                "nodes": {},
-            }
-            add_subgraph_node(vswitch_id, anchor_id, mermaid_label(*label_parts))
-            register_resource_node(anchor_id, row, "vswitch_id", "resource_id")
-            add_edge(root_node, anchor_id)
-            return anchor_id
-
-        def attach_node(node_id: str, label: str, row: dict[str, str], *keys: str) -> None:
-            vswitch_id = row.get("_topology_vswitch_id", "")
-            if vswitch_id and vswitch_id in subgraphs:
-                add_subgraph_node(vswitch_id, node_id, label)
-                register_resource_node(node_id, row, *keys)
-                add_edge(subgraphs[vswitch_id]["anchor_id"], node_id)
-                return
-            add_root_node(node_id, label)
-            register_resource_node(node_id, row, *keys)
-
-        add_root_node(root_node, mermaid_label(root_label))
-
-        for row in bucket["vswitches"]:
-            ensure_vswitch_anchor(row)
-
-        for row in bucket["ecs"]:
-            name = resource_display_name(row, ("instance_name",), ("instance_id",))
-            node_id = mermaid_node_id("ecs", row.get("region_id", ""), row.get("instance_id", ""))
-            label_parts = ["ECS", name, row.get("instance_id", "")]
-            if row.get("private_ip"):
-                label_parts.append(f"私网: {row['private_ip']}")
-            if row.get("public_ip"):
-                label_parts.append(f"公网: {row['public_ip']}")
-            if row.get("eip"):
-                label_parts.append(f"EIP: {row['eip']}")
-            security_groups = summarize_security_groups(row.get("security_group_ids", ""))
-            if security_groups:
-                label_parts.append(f"安全组: {security_groups}")
-            attach_node(node_id, mermaid_label(*label_parts), row, "instance_id", "resource_id")
-
-        for row in bucket["enis"]:
-            instance_id = row.get("instance_id", "")
-            if instance_id and resource_nodes.get(instance_id):
-                continue
-            node_id = mermaid_node_id("eni", row.get("region_id", ""), row.get("network_interface_id", ""))
-            label_parts = [
-                "ENI",
-                resource_display_name(row, ("name",), ("network_interface_id", "resource_id")),
-                row.get("network_interface_id", ""),
-            ]
-            if row.get("private_ip"):
-                label_parts.append(f"私网: {row['private_ip']}")
-            if row.get("status"):
-                label_parts.append(f"状态: {row['status']}")
-            attach_node(node_id, mermaid_label(*label_parts), row, "network_interface_id", "resource_id")
-
-        for row in bucket["rds"] + bucket["redis"]:
-            service_name = "RDS" if row.get("service_code") == "rds" else "Redis"
-            node_id = mermaid_node_id(row.get("service_code", "db"), row.get("region_id", ""), row.get("instance_id", ""))
-            label_parts = [
-                service_name,
-                resource_display_name(row, ("resource_name",), ("instance_id", "resource_id")),
-                row.get("instance_id", ""),
-            ]
-            engine = " ".join(part for part in (row.get("engine", ""), row.get("engine_version", "")) if part)
-            if engine:
-                label_parts.append(engine)
-            if row.get("endpoint_summary"):
-                label_parts.append(row["endpoint_summary"])
-            attach_node(node_id, mermaid_label(*label_parts), row, "instance_id", "resource_id")
-
-        for row in bucket["nats"]:
-            node_id = mermaid_node_id("nat", row.get("region_id", ""), row.get("nat_gateway_id", ""))
-            label_parts = [
-                "NAT",
-                resource_display_name(row, ("resource_name",), ("nat_gateway_id", "resource_id")),
-                row.get("nat_gateway_id", ""),
-            ]
-            if row.get("spec"):
-                label_parts.append(f"规格: {row['spec']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "nat_gateway_id", "resource_id")
-
-        for row in bucket["vpn_gateways"]:
-            node_id = mermaid_node_id("vpn_gw", row.get("region_id", ""), row.get("vpn_gateway_id", ""))
-            label_parts = [
-                "VPN Gateway",
-                resource_display_name(row, ("resource_name",), ("vpn_gateway_id", "resource_id")),
-                row.get("vpn_gateway_id", ""),
-            ]
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "vpn_gateway_id", "resource_id")
-
-        for row in bucket["lbs"]:
-            service_name = row.get("service_code", "").upper() or "LB"
-            node_id = mermaid_node_id("lb", row.get("service_code", ""), row.get("region_id", ""), row.get("load_balancer_id", ""))
-            label_parts = [
-                service_name,
-                resource_display_name(row, ("load_balancer_name", "resource_name"), ("load_balancer_id", "resource_id")),
-                row.get("load_balancer_id", ""),
-            ]
-            if row.get("address"):
-                label_parts.append(row["address"])
-            if row.get("address_type"):
-                label_parts.append(f"地址类型: {row['address_type']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "load_balancer_id", "resource_id")
-
-        for row in bucket["server_groups"]:
-            node_id = mermaid_node_id("sgroup", row.get("service_code", ""), row.get("region_id", ""), row.get("server_group_id", ""))
-            label_parts = [
-                "ServerGroup",
-                resource_display_name(row, ("server_group_name", "resource_name"), ("server_group_id", "resource_id")),
-                row.get("server_group_id", ""),
-            ]
-            protocol = " / ".join(part for part in (row.get("server_group_type", ""), row.get("protocol", "")) if part)
-            if protocol:
-                label_parts.append(protocol)
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "server_group_id", "resource_id")
-
-        for row in bucket["listeners"]:
-            node_id = mermaid_node_id("listener", row.get("service_code", ""), row.get("region_id", ""), row.get("listener_id", row.get("load_balancer_id", "")))
-            label_parts = [row.get("service_code", "").upper() + " Listener"]
-            protocol = row.get("protocol", "")
-            port = row.get("port", "")
-            if protocol or port:
-                label_parts.append("/".join(part for part in (protocol, port) if part))
-            if row.get("status"):
-                label_parts.append(f"状态: {row['status']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "listener_id", "resource_id")
-            parent_id = resource_nodes.get(row.get("load_balancer_id", ""), "")
-            if parent_id:
-                add_edge(parent_id, node_id)
-            for server_group_id in split_ids(row.get("server_group_ids", "")):
-                target_id = resource_nodes.get(server_group_id, "")
-                if target_id:
-                    add_edge(node_id, target_id)
-
-        for row in bucket["server_group_servers"]:
-            group_node_id = resource_nodes.get(row.get("server_group_id", ""), "")
-            if not group_node_id:
-                continue
-            target_id = resource_nodes.get(row.get("server_id", ""), "")
-            if target_id:
-                add_edge(group_node_id, target_id)
-                continue
-            node_id = mermaid_node_id("backend", row.get("service_code", ""), row.get("region_id", ""), row.get("server_id", row.get("resource_id", "")))
-            label_parts = ["Backend", row.get("server_id", "") or row.get("resource_id", "")]
-            if row.get("port"):
-                label_parts.append(f"端口: {row['port']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "server_id", "resource_id")
-            add_edge(group_node_id, node_id)
-
-        for row in bucket["eips"]:
-            node_id = mermaid_node_id("eip", row.get("region_id", ""), row.get("allocation_id", ""))
-            label_parts = ["EIP", row.get("ip_address", ""), row.get("allocation_id", "")]
-            if row.get("status"):
-                label_parts.append(f"状态: {row['status']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "allocation_id", "resource_id")
-            for key in ("instance_id", "associated_instance_id", "bind_resource_id"):
-                target_id = resource_nodes.get(row.get(key, ""), "")
-                if target_id:
-                    add_edge(node_id, target_id)
-                    break
-
-        for row in bucket["vpn_connections"]:
-            parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
-            node_id = mermaid_node_id("vpn_conn", row.get("region_id", ""), row.get("vpn_connection_id", ""))
-            label_parts = [
-                "VPN Connection",
-                resource_display_name(row, ("resource_name",), ("vpn_connection_id", "resource_id")),
-                row.get("vpn_connection_id", ""),
-            ]
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "vpn_connection_id", "resource_id")
-            if parent_id:
-                add_edge(parent_id, node_id)
-
-        for row in bucket["ssl_vpn_servers"]:
-            parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
-            node_id = mermaid_node_id("ssl_vpn", row.get("region_id", ""), row.get("ssl_vpn_server_id", ""))
-            label_parts = [
-                "SSL-VPN",
-                resource_display_name(row, ("resource_name",), ("ssl_vpn_server_id", "resource_id")),
-                row.get("ssl_vpn_server_id", ""),
-            ]
-            if row.get("internet_ip"):
-                label_parts.append(f"公网: {row['internet_ip']}")
-            add_root_node(node_id, mermaid_label(*label_parts))
-            register_resource_node(node_id, row, "ssl_vpn_server_id", "resource_id")
-            if parent_id:
-                add_edge(parent_id, node_id)
-
-        for node_id in root_node_ids:
-            if node_id != root_node and node_id not in incoming:
-                add_edge(root_node, node_id)
-
-        mermaid_lines = ["```mermaid", "flowchart LR"]
-        for node_id, definition in root_nodes.items():
-            mermaid_lines.append(f"  {definition}")
-        for vswitch_id in sorted(subgraphs, key=lambda item: (subgraphs[item]["title"], item)):
-            mermaid_lines.append(
-                f'  subgraph {mermaid_node_id("subgraph", vswitch_id)}["{subgraphs[vswitch_id]["title"]}"]'
-            )
-            mermaid_lines.append("    direction TB")
-            for definition in subgraphs[vswitch_id]["nodes"].values():
-                mermaid_lines.append(f"    {definition}")
-            mermaid_lines.append("  end")
-        mermaid_lines.extend(edges)
-        mermaid_lines.append("```")
-
-        lines = [
-            f"# {title}",
-            "",
-            "- 说明：仅根据显式字段和确定性映射生成资源关系拓扑，不表示真实访问路径。",
-        ]
-        if events:
-            lines.extend(
-                [
-                    "",
-                    "> 检测到部分关系缺失，相关接口失败如下：",
-                    *[
-                        f"> - {row.get('service', '')} / {row.get('api', '')} / {row.get('message', '')}"
-                        for row in events
-                    ],
-                ]
-            )
-        lines.extend(["", *mermaid_lines, ""])
-        return "\n".join(lines).rstrip() + "\n"
-
-    docs: dict[str, str] = {}
-    topology_entries: list[tuple[str, str, str]] = []
-    for vpc_id, bucket in sorted(groups.items(), key=lambda item: (item[1].get("vpc", {}).get("region_id", ""), item[0])):
-        vpc_row = bucket.get("vpc", {})
-        region_id = vpc_row.get("region_id", "")
-        vpc_name = resource_display_name(vpc_row, ("resource_name",), ("resource_id",)) if vpc_row else vpc_id
-        title = f"{region_id or 'unknown'} / {vpc_name} / {vpc_id}"
-        filename = f"{safe_dirname(region_id or 'unknown')}__{safe_dirname(vpc_id)}.md"
-        events = topology_collection_events(details, region_id=region_id, resource_ids=bucket["resource_ids"])
-        docs[filename] = render_bucket_markdown(
-            f"网络拓扑：{title}",
-            mermaid_label("VPC", vpc_name, vpc_id),
-            bucket,
-            events,
-        )
-        topology_entries.append((filename, title, str(len(bucket["resource_ids"]))))
-
-    unassigned_events = topology_collection_events(details, resource_ids=unassigned["resource_ids"])
-    docs["unassigned.md"] = render_bucket_markdown(
-        "网络拓扑：未归属资源",
-        mermaid_label("未归属 VPC 的资源", subscription),
-        unassigned,
-        unassigned_events,
-    )
-
-    readme_lines = [
-        "# 网络拓扑文件",
-        "",
-        "- 说明：每个 `VPC` 单独输出一份 `Mermaid` 拓扑图，只展示显式字段和确定性映射能确认的关系。",
-        "- 边界：不按名称、同地域或同标签猜测依赖关系；未能确认 `VPC` 归属的资源会写入 `unassigned.md`。",
-        "",
-        "## 文件列表",
-    ]
-    if topology_entries:
-        readme_lines.extend(
-            f"- [{filename}](./{filename})：{title}，资源ID数={count}"
-            for filename, title, count in topology_entries
-        )
-    else:
-        readme_lines.append("- 当前未识别到 VPC 资源。")
-    readme_lines.append(
-        f"- [unassigned.md](./unassigned.md)：未能确认 VPC 归属的资源，资源ID数={len(unassigned['resource_ids'])}"
-    )
-    readme_lines.append("")
-    docs["README.md"] = "\n".join(readme_lines)
-    return docs
-
-
-def write_topology_documents(path: Path, documents: dict[str, str]) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    for filename, content in documents.items():
-        write_text(path / filename, content)
-
-
-TOPOLOGY_KIND_ORDER = {
-    "root": 0,
-    "vswitch": 1,
-    "nat": 2,
-    "vpn_gateway": 3,
-    "ssl_vpn": 4,
-    "lb": 5,
-    "listener": 6,
-    "server_group": 7,
-    "backend": 8,
-    "eip": 9,
-    "ecs": 10,
-    "eni": 11,
-    "rds": 12,
-    "redis": 13,
-    "note": 99,
-}
-
-TOPOLOGY_KIND_ICON_TITLES = {
-    "root": ("Cloud 01", "Cloud 02", "Cloud 03", "Cloud 04", "Cloud 05"),
-    "vswitch": ("Switch 01", "Switch 02", "Switch 03"),
-    "ecs": ("Computer", "K8S Node"),
-    "eni": ("Network Card", "Network Port"),
-    "eip": ("Cloud 04", "Cloud 05"),
-    "nat": ("Router 01", "Router 02"),
-    "vpn_gateway": ("Router 02", "Router 01"),
-    "vpn_connection": ("Router 02", "Router 01"),
-    "ssl_vpn": ("Router 02", "Router 01"),
-    "lb": ("Router 01", "Cloud 02"),
-    "listener": ("Network Port", "Router 01"),
-    "server_group": ("Container",),
-    "backend": ("Computer", "K8S Node"),
-    "rds": ("Database",),
-    "redis": ("Redis",),
-    "note": (),
-}
-
-TOPOLOGY_KIND_FILL_STROKE = {
-    "root": ("#E0F2FE", "#0284C7"),
-    "vswitch": ("#ECFDF5", "#059669"),
-    "compute": ("#EFF6FF", "#2563EB"),
-    "network": ("#EEF2FF", "#6366F1"),
-    "db": ("#FFF7ED", "#D97706"),
-    "redis": ("#FEF2F2", "#DC2626"),
-    "note": ("#F8FAFC", "#CBD5E1"),
-    "fallback": ("#FFFFFF", "#94A3B8"),
-}
-
-
-def topology_kind_group(kind: str) -> str:
-    if kind in {"root"}:
-        return "root"
-    if kind in {"vswitch"}:
-        return "vswitch"
-    if kind in {"ecs", "backend"}:
-        return "compute"
-    if kind in {"rds"}:
-        return "db"
-    if kind in {"redis"}:
-        return "redis"
-    if kind in {"note"}:
-        return "note"
-    if kind in {"eni", "eip", "nat", "vpn_gateway", "vpn_connection", "ssl_vpn", "lb", "listener", "server_group"}:
-        return "network"
-    return "fallback"
-
-
-def topology_fill_stroke(kind: str) -> tuple[str, str]:
-    return TOPOLOGY_KIND_FILL_STROKE.get(topology_kind_group(kind), TOPOLOGY_KIND_FILL_STROKE["fallback"])
-
-
-def topology_icon_titles(kind: str, service_code: str = "") -> tuple[str, ...]:
-    if kind == "lb" and service_code:
-        return TOPOLOGY_KIND_ICON_TITLES.get("lb", ())
-    return TOPOLOGY_KIND_ICON_TITLES.get(kind, ())
-
-
-def drawio_node_label(lines: list[str], *, bold_first: bool = True) -> str:
-    if not lines:
-        return ""
-    rendered: list[str] = []
-    for index, line in enumerate(lines):
-        text = line.replace("\n", " ")
-        if index == 0 and bold_first:
-            rendered.append(f"<span style=\"font-weight:bold;\">{text}</span>")
-        else:
-            rendered.append(f"<span>{text}</span>")
-    return "<div style=\"text-align:left;\">" + "<br/>".join(rendered) + "</div>"
-
-
-def drawio_node_style(kind: str, icon_data: str = "") -> str:
-    fill_color, stroke_color = topology_fill_stroke(kind)
-    styles = [
-        "rounded=1",
-        "whiteSpace=wrap",
-        "html=1",
-        f"fillColor={fill_color}",
-        f"strokeColor={stroke_color}",
-        "fontColor=#0F172A",
-        "align=left",
-        "verticalAlign=middle",
-        "spacing=8",
-        "spacingTop=6",
-        "spacingBottom=6",
-    ]
-    if icon_data:
-        styles.extend(
-            [
-                "shape=label",
-                f"image={icon_data}",
-                "imageAlign=left",
-                "imageVerticalAlign=middle",
-                "imageWidth=36",
-                "imageHeight=36",
-                "spacingLeft=56",
-            ]
-        )
-    else:
-        styles.extend(
-            [
-                "shape=roundedRect",
-                "spacingLeft=12",
-            ]
-        )
-    return ";".join(styles) + ";"
-
-
-def drawio_note_style() -> str:
-    fill_color, stroke_color = topology_fill_stroke("note")
-    return ";".join(
-        [
-            "rounded=1",
-            "whiteSpace=wrap",
-            "html=1",
-            f"fillColor={fill_color}",
-            f"strokeColor={stroke_color}",
-            "fontColor=#334155",
-            "align=left",
-            "verticalAlign=top",
-            "spacing=12",
-            "shape=note",
-        ]
-    ) + ";"
-
-
-def drawio_edge_style() -> str:
-    return ";".join(
-        [
-            "edgeStyle=orthogonalEdgeStyle",
-            "rounded=0",
-            "orthogonalLoop=1",
-            "jettySize=auto",
-            "html=1",
-            "endArrow=block",
-            "endFill=1",
-            "strokeColor=#64748B",
-        ]
-    ) + ";"
-
-
-def build_topology_note_lines(events: list[dict[str, str]]) -> list[str]:
-    lines = [
-        "仅根据显式字段和确定性映射生成资源关系拓扑。",
-        "不代表真实流量路径。",
-    ]
-    if events:
-        lines.append("采集异常：")
-        for row in events[:3]:
-            lines.append(
-                f"{row.get('service', '')} / {row.get('api', '')} / {row.get('message', '')}"
-            )
-        if len(events) > 3:
-            lines.append(f"等{len(events) - 3}项")
-    return lines
-
-
-def build_topology_drawio_node(
-    node_id: str,
-    kind: str,
-    label_lines: list[str],
-    *,
-    group_id: str = "",
-    icon_titles: tuple[str, ...] = (),
-    icons: dict[str, str],
-) -> TopologyDiagramNode:
-    return TopologyDiagramNode(
-        node_id=node_id,
-        kind=kind,
-        label_lines=label_lines,
-        group_id=group_id,
-        icon_title=next((title for title in icon_titles if title in icons), ""),
-        width=260,
-        height=128,
-        x=0,
-        y=0,
-    )
-
-
-def build_topology_drawio_graph(
+def render_bucket_plantuml(
     title: str,
-    subscription: str,
-    root_label_lines: list[str],
+    root_label: str,
+    root_id: str,
     bucket: dict[str, Any],
     events: list[dict[str, str]],
-    icons: dict[str, str],
-) -> TopologyRenderData:
-    root_node_id = mermaid_node_id("topology_root", *root_label_lines)
-    nodes: dict[str, TopologyDiagramNode] = {}
-    edges: list[tuple[str, str]] = []
-    edge_seen: set[tuple[str, str]] = set()
-    incoming: set[str] = set()
+) -> str:
+    """将单个 VPC 桶渲染为 PlantUML 嵌入 Markdown 的拓扑文档。"""
+    vpc_alias = plantuml_alias("VPC", root_id)
+    vswitch_groups: dict[str, dict[str, Any]] = {}
     resource_nodes: dict[str, str] = {}
-    group_ids: set[str] = set()
-    anchor_nodes: dict[str, str] = {}
+    root_nodes: dict[str, str] = {}
+    edges: list[str] = []
+    edge_seen: set[tuple[str, str]] = set()
+    connected: set[str] = set()
 
-    def add_edge(source_id: str, target_id: str) -> None:
-        key = (source_id, target_id)
-        if not source_id or not target_id or key in edge_seen:
+    def add_edge(src: str, dst: str, label_text: str = "", dashed: bool = False) -> None:
+        key = (src, dst)
+        if not src or not dst or key in edge_seen:
             return
         edge_seen.add(key)
-        incoming.add(target_id)
-        edges.append(key)
+        connected.add(src)
+        connected.add(dst)
+        arrow = "..>" if dashed else "-->"
+        if label_text:
+            edges.append(f"{src} {arrow} {dst} : \"{label_text}\"")
+        else:
+            edges.append(f"{src} {arrow} {dst}")
 
-    def register_resource_node(node_id: str, row: dict[str, str], *keys: str) -> None:
+    def register_resource_node(alias: str, row: dict[str, str], *keys: str) -> None:
         for key in keys:
             value = row.get(key, "")
             if value:
-                resource_nodes[value] = node_id
+                resource_nodes[value] = alias
 
-    def store_node(
-        node_id: str,
-        kind: str,
-        label_lines: list[str],
-        *,
-        row: dict[str, str] | None = None,
-        resource_keys: tuple[str, ...] = (),
-        group_id: str = "",
-    ) -> None:
-        if node_id in nodes:
-            node = nodes[node_id]
-            if group_id and not node.group_id:
-                node.group_id = group_id
-            if row:
-                register_resource_node(node_id, row, *resource_keys)
-            return
+    def add_root_node(alias: str, kind: str, label: str) -> None:
+        if alias not in root_nodes:
+            root_nodes[alias] = _plantuml_node_def(alias, kind, label)
 
-        icon_titles = topology_icon_titles(kind, (row or {}).get("service_code", ""))
-        node = build_topology_drawio_node(
-            node_id,
-            kind,
-            label_lines,
-            group_id=group_id,
-            icon_titles=icon_titles,
-            icons=icons,
-        )
-        nodes[node_id] = node
-        if group_id:
-            group_ids.add(group_id)
-        if row:
-            register_resource_node(node_id, row, *resource_keys)
-
-    def add_root_node(
-        node_id: str,
-        kind: str,
-        label_lines: list[str],
-        *,
-        row: dict[str, str] | None = None,
-        resource_keys: tuple[str, ...] = (),
-    ) -> None:
-        store_node(node_id, kind, label_lines, row=row, resource_keys=resource_keys)
-
-    def ensure_vswitch_anchor(row: dict[str, str]) -> str:
+    def ensure_vswitch_group(row: dict[str, str]) -> str:
         vswitch_id = row.get("vswitch_id") or row.get("resource_id", "")
-        if not vswitch_id:
-            return ""
-        anchor_id = anchor_nodes.get(vswitch_id)
-        if anchor_id:
-            return anchor_id
-        label_lines = topology_label_lines(
+        if vswitch_id in vswitch_groups:
+            return vswitch_groups[vswitch_id]["anchor_alias"]
+        label_parts = [
             "VSwitch",
             resource_display_name(row, ("resource_name",), ("vswitch_id", "resource_id")),
-            row.get("cidr_block", ""),
-            row.get("zone_id", ""),
-        )
-        anchor_id = mermaid_node_id("vsw", row.get("region_id", ""), vswitch_id)
-        anchor_nodes[vswitch_id] = anchor_id
-        store_node(
-            anchor_id,
-            "vswitch",
-            label_lines,
-            row=row,
-            resource_keys=("vswitch_id", "resource_id"),
-            group_id=vswitch_id,
-        )
-        add_edge(root_node_id, anchor_id)
-        return anchor_id
+        ]
+        if row.get("cidr_block"):
+            label_parts.append(row["cidr_block"])
+        if row.get("zone_id"):
+            label_parts.append(row["zone_id"])
+        anchor_alias = plantuml_alias("VSW", vswitch_id)
+        vswitch_groups[vswitch_id] = {
+            "label": plantuml_label(*label_parts),
+            "anchor_alias": anchor_alias,
+            "nodes": {},
+        }
+        register_resource_node(anchor_alias, row, "vswitch_id", "resource_id")
+        add_edge(vpc_alias, anchor_alias, "包含")
+        return anchor_alias
 
-    def attach_node(
-        node_id: str,
-        kind: str,
-        label_lines: list[str],
-        row: dict[str, str],
-        *resource_keys: str,
-    ) -> None:
+    def attach_node(alias: str, kind: str, label: str, row: dict[str, str], *keys: str) -> None:
         vswitch_id = row.get("_topology_vswitch_id", "")
-        if vswitch_id and vswitch_id in anchor_nodes:
-            store_node(
-                node_id,
-                kind,
-                label_lines,
-                row=row,
-                resource_keys=resource_keys,
-                group_id=vswitch_id,
-            )
-            add_edge(anchor_nodes[vswitch_id], node_id)
+        if vswitch_id and vswitch_id in vswitch_groups:
+            vswitch_groups[vswitch_id]["nodes"][alias] = _plantuml_node_def(alias, kind, label)
+            register_resource_node(alias, row, *keys)
+            add_edge(vswitch_groups[vswitch_id]["anchor_alias"], alias)
             return
-        store_node(node_id, kind, label_lines, row=row, resource_keys=resource_keys)
+        add_root_node(alias, kind, label)
+        register_resource_node(alias, row, *keys)
 
-    store_node(root_node_id, "root", root_label_lines)
+    # VPC 根节点
+    add_root_node(vpc_alias, "root", root_label)
 
+    # VSwitch 子分组
     for row in bucket["vswitches"]:
-        ensure_vswitch_anchor(row)
+        ensure_vswitch_group(row)
 
+    # ECS
     for row in bucket["ecs"]:
         name = resource_display_name(row, ("instance_name",), ("instance_id",))
-        node_id = mermaid_node_id("ecs", row.get("region_id", ""), row.get("instance_id", ""))
-        label_lines = topology_label_lines(
-            "ECS",
-            name,
-            row.get("instance_id", ""),
-            f"私网: {row['private_ip']}" if row.get("private_ip") else "",
-            f"公网: {row['public_ip']}" if row.get("public_ip") else "",
-            f"EIP: {row['eip']}" if row.get("eip") else "",
-            f"安全组: {summarize_security_groups(row.get('security_group_ids', ''))}"
-            if summarize_security_groups(row.get("security_group_ids", ""))
-            else "",
-        )
-        attach_node(node_id, "ecs", label_lines, row, "instance_id", "resource_id")
+        alias = plantuml_alias("ECS", row.get("instance_id", ""))
+        label_parts = ["ECS", name, row.get("instance_id", "")]
+        if row.get("private_ip"):
+            label_parts.append(f"私网: {row['private_ip']}")
+        if row.get("public_ip"):
+            label_parts.append(f"公网: {row['public_ip']}")
+        if row.get("eip"):
+            label_parts.append(f"EIP: {row['eip']}")
+        security_groups = summarize_security_groups(row.get("security_group_ids", ""))
+        if security_groups:
+            label_parts.append(f"安全组: {security_groups}")
+        attach_node(alias, "ecs", plantuml_label(*label_parts), row, "instance_id", "resource_id")
 
+    # ENI
     for row in bucket["enis"]:
         instance_id = row.get("instance_id", "")
         if instance_id and resource_nodes.get(instance_id):
             continue
-        node_id = mermaid_node_id("eni", row.get("region_id", ""), row.get("network_interface_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("ENI", row.get("network_interface_id", ""))
+        label_parts = [
             "ENI",
             resource_display_name(row, ("name",), ("network_interface_id", "resource_id")),
             row.get("network_interface_id", ""),
-            f"私网: {row['private_ip']}" if row.get("private_ip") else "",
-            f"状态: {row['status']}" if row.get("status") else "",
-        )
-        attach_node(node_id, "eni", label_lines, row, "network_interface_id", "resource_id")
+        ]
+        if row.get("private_ip"):
+            label_parts.append(f"私网: {row['private_ip']}")
+        attach_node(alias, "eni", plantuml_label(*label_parts), row, "network_interface_id", "resource_id")
 
+    # RDS / Redis
     for row in bucket["rds"] + bucket["redis"]:
-        service_name = "RDS" if row.get("service_code") == "rds" else "Redis"
-        node_id = mermaid_node_id(row.get("service_code", "db"), row.get("region_id", ""), row.get("instance_id", ""))
-        engine = " ".join(part for part in (row.get("engine", ""), row.get("engine_version", "")) if part)
-        label_lines = topology_label_lines(
+        kind = "rds" if row.get("service_code") == "rds" else "redis"
+        service_name = "RDS" if kind == "rds" else "Redis"
+        alias = plantuml_alias(kind, row.get("instance_id", ""))
+        label_parts = [
             service_name,
             resource_display_name(row, ("resource_name",), ("instance_id", "resource_id")),
             row.get("instance_id", ""),
-            engine,
-            row.get("endpoint_summary", ""),
-        )
-        attach_node(node_id, row.get("service_code", "db"), label_lines, row, "instance_id", "resource_id")
+        ]
+        engine = " ".join(topology_label_lines(row.get("engine", ""), row.get("engine_version", "")))
+        if engine:
+            label_parts.append(engine)
+        if row.get("endpoint_summary"):
+            label_parts.append(row["endpoint_summary"])
+        attach_node(alias, kind, plantuml_label(*label_parts), row, "instance_id", "resource_id")
 
+    # NAT
     for row in bucket["nats"]:
-        node_id = mermaid_node_id("nat", row.get("region_id", ""), row.get("nat_gateway_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("NAT", row.get("nat_gateway_id", ""))
+        label_parts = [
             "NAT",
             resource_display_name(row, ("resource_name",), ("nat_gateway_id", "resource_id")),
             row.get("nat_gateway_id", ""),
-            f"规格: {row['spec']}" if row.get("spec") else "",
-        )
-        add_root_node(node_id, "nat", label_lines, row=row, resource_keys=("nat_gateway_id", "resource_id"))
+        ]
+        if row.get("spec"):
+            label_parts.append(f"规格: {row['spec']}")
+        add_root_node(alias, "nat", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "nat_gateway_id", "resource_id")
 
+    # VPN Gateway
     for row in bucket["vpn_gateways"]:
-        node_id = mermaid_node_id("vpn_gw", row.get("region_id", ""), row.get("vpn_gateway_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("VPN_GW", row.get("vpn_gateway_id", ""))
+        label_parts = [
             "VPN Gateway",
             resource_display_name(row, ("resource_name",), ("vpn_gateway_id", "resource_id")),
             row.get("vpn_gateway_id", ""),
-        )
-        add_root_node(node_id, "vpn_gateway", label_lines, row=row, resource_keys=("vpn_gateway_id", "resource_id"))
+        ]
+        add_root_node(alias, "vpn_gateway", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "vpn_gateway_id", "resource_id")
 
+    # LB (SLB/ALB/NLB)
     for row in bucket["lbs"]:
         service_name = row.get("service_code", "").upper() or "LB"
-        node_id = mermaid_node_id("lb", row.get("service_code", ""), row.get("region_id", ""), row.get("load_balancer_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("LB", row.get("load_balancer_id", ""))
+        label_parts = [
             service_name,
             resource_display_name(row, ("load_balancer_name", "resource_name"), ("load_balancer_id", "resource_id")),
             row.get("load_balancer_id", ""),
-            row.get("address", ""),
-            f"地址类型: {row['address_type']}" if row.get("address_type") else "",
-        )
-        add_root_node(node_id, "lb", label_lines, row=row, resource_keys=("load_balancer_id", "resource_id"))
+        ]
+        if row.get("address"):
+            label_parts.append(row["address"])
+        add_root_node(alias, "lb", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "load_balancer_id", "resource_id")
 
+    # ServerGroup
     for row in bucket["server_groups"]:
-        node_id = mermaid_node_id("sgroup", row.get("service_code", ""), row.get("region_id", ""), row.get("server_group_id", ""))
-        protocol = " / ".join(part for part in (row.get("server_group_type", ""), row.get("protocol", "")) if part)
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("SG", row.get("server_group_id", ""))
+        label_parts = [
             "ServerGroup",
             resource_display_name(row, ("server_group_name", "resource_name"), ("server_group_id", "resource_id")),
             row.get("server_group_id", ""),
-            protocol,
-        )
-        add_root_node(node_id, "server_group", label_lines, row=row, resource_keys=("server_group_id", "resource_id"))
+        ]
+        protocol = " / ".join(topology_label_lines(row.get("server_group_type", ""), row.get("protocol", "")))
+        if protocol:
+            label_parts.append(protocol)
+        add_root_node(alias, "server_group", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "server_group_id", "resource_id")
 
+    # Listener
     for row in bucket["listeners"]:
-        node_id = mermaid_node_id(
-            "listener",
-            row.get("service_code", ""),
-            row.get("region_id", ""),
-            row.get("listener_id", row.get("load_balancer_id", "")),
-        )
+        alias = plantuml_alias("LIS", row.get("listener_id", row.get("load_balancer_id", "")))
+        label_parts = [row.get("service_code", "").upper() + " Listener"]
         protocol = row.get("protocol", "")
         port = row.get("port", "")
-        label_lines = topology_label_lines(
-            f"{row.get('service_code', '').upper()} Listener",
-            "/".join(part for part in (protocol, port) if part),
-            f"状态: {row['status']}" if row.get("status") else "",
-        )
-        add_root_node(node_id, "listener", label_lines, row=row, resource_keys=("listener_id", "resource_id"))
-        parent_id = resource_nodes.get(row.get("load_balancer_id", ""), "")
-        if parent_id:
-            add_edge(parent_id, node_id)
+        if protocol or port:
+            label_parts.append("/".join(part for part in (protocol, port) if part))
+        add_root_node(alias, "listener", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "listener_id", "resource_id")
+        parent_alias = resource_nodes.get(row.get("load_balancer_id", ""), "")
+        if parent_alias:
+            add_edge(parent_alias, alias, "监听")
         for server_group_id in split_ids(row.get("server_group_ids", "")):
-            target_id = resource_nodes.get(server_group_id, "")
-            if target_id:
-                add_edge(node_id, target_id)
+            target_alias = resource_nodes.get(server_group_id, "")
+            if target_alias:
+                add_edge(alias, target_alias, "转发")
 
+    # Backend Server
     for row in bucket["server_group_servers"]:
-        group_node_id = resource_nodes.get(row.get("server_group_id", ""), "")
-        if not group_node_id:
+        group_alias = resource_nodes.get(row.get("server_group_id", ""), "")
+        if not group_alias:
             continue
-        target_id = resource_nodes.get(row.get("server_id", ""), "")
-        if target_id:
-            add_edge(group_node_id, target_id)
+        target_alias = resource_nodes.get(row.get("server_id", ""), "")
+        if target_alias:
+            add_edge(group_alias, target_alias, "后端", dashed=True)
             continue
-        node_id = mermaid_node_id("backend", row.get("service_code", ""), row.get("region_id", ""), row.get("server_id", row.get("resource_id", "")))
-        label_lines = topology_label_lines(
-            "Backend",
-            row.get("server_id", "") or row.get("resource_id", ""),
-            f"端口: {row['port']}" if row.get("port") else "",
-        )
-        add_root_node(node_id, "backend", label_lines, row=row, resource_keys=("server_id", "resource_id"))
-        add_edge(group_node_id, node_id)
+        alias = plantuml_alias("BACKEND", row.get("server_id", row.get("resource_id", "")))
+        label_parts = ["Backend", row.get("server_id", "") or row.get("resource_id", "")]
+        if row.get("port"):
+            label_parts.append(f"端口: {row['port']}")
+        add_root_node(alias, "backend", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "server_id", "resource_id")
+        add_edge(group_alias, alias, "后端", dashed=True)
 
+    # EIP
     for row in bucket["eips"]:
-        node_id = mermaid_node_id("eip", row.get("region_id", ""), row.get("allocation_id", ""))
-        label_lines = topology_label_lines(
-            "EIP",
-            row.get("ip_address", ""),
-            row.get("allocation_id", ""),
-            f"状态: {row['status']}" if row.get("status") else "",
-        )
-        add_root_node(node_id, "eip", label_lines, row=row, resource_keys=("allocation_id", "resource_id"))
+        alias = plantuml_alias("EIP", row.get("allocation_id", ""))
+        label_parts = ["EIP", row.get("ip_address", ""), row.get("allocation_id", "")]
+        if row.get("status"):
+            label_parts.append(f"状态: {row['status']}")
+        add_root_node(alias, "eip", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "allocation_id", "resource_id")
         for key in ("instance_id", "associated_instance_id", "bind_resource_id"):
-            target_id = resource_nodes.get(row.get(key, ""), "")
-            if target_id:
-                add_edge(node_id, target_id)
+            target_alias = resource_nodes.get(row.get(key, ""), "")
+            if target_alias:
+                add_edge(alias, target_alias, "绑定")
                 break
 
+    # VPN Connection
     for row in bucket["vpn_connections"]:
-        parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
-        node_id = mermaid_node_id("vpn_conn", row.get("region_id", ""), row.get("vpn_connection_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("VPN_CONN", row.get("vpn_connection_id", ""))
+        label_parts = [
             "VPN Connection",
             resource_display_name(row, ("resource_name",), ("vpn_connection_id", "resource_id")),
             row.get("vpn_connection_id", ""),
-        )
-        add_root_node(node_id, "vpn_connection", label_lines, row=row, resource_keys=("vpn_connection_id", "resource_id"))
-        if parent_id:
-            add_edge(parent_id, node_id)
+        ]
+        add_root_node(alias, "vpn_connection", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "vpn_connection_id", "resource_id")
+        parent_alias = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
+        if parent_alias:
+            add_edge(parent_alias, alias, dashed=True)
 
+    # SSL-VPN
     for row in bucket["ssl_vpn_servers"]:
-        parent_id = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
-        node_id = mermaid_node_id("ssl_vpn", row.get("region_id", ""), row.get("ssl_vpn_server_id", ""))
-        label_lines = topology_label_lines(
+        alias = plantuml_alias("SSL_VPN", row.get("ssl_vpn_server_id", ""))
+        label_parts = [
             "SSL-VPN",
             resource_display_name(row, ("resource_name",), ("ssl_vpn_server_id", "resource_id")),
             row.get("ssl_vpn_server_id", ""),
-            f"公网: {row['internet_ip']}" if row.get("internet_ip") else "",
+        ]
+        if row.get("internet_ip"):
+            label_parts.append(f"公网: {row['internet_ip']}")
+        add_root_node(alias, "ssl_vpn", plantuml_label(*label_parts))
+        register_resource_node(alias, row, "ssl_vpn_server_id", "resource_id")
+        parent_alias = resource_nodes.get(row.get("vpn_gateway_id", ""), "")
+        if parent_alias:
+            add_edge(parent_alias, alias, dashed=True)
+
+    # 未连接到任何其他节点的根级资源，连到 VPC
+    for alias in root_nodes:
+        if alias != vpc_alias and alias not in connected:
+            add_edge(vpc_alias, alias)
+
+    # 构建 PlantUML 代码（扁平布局，不使用嵌套块）
+    puml_lines = ["@startuml"]
+    puml_lines.append("' 全局样式")
+    puml_lines.append("skinparam handwritten false")
+    puml_lines.append("skinparam RectangleBackgroundColor #F5F5F5")
+    puml_lines.append("skinparam RectangleBorderColor #666666")
+    puml_lines.append("skinparam NodeBackgroundColor #E3F2FD")
+    puml_lines.append("skinparam NodeBorderColor #1E88E5")
+    puml_lines.append("skinparam DatabaseBackgroundColor #FFF3E0")
+    puml_lines.append("skinparam DatabaseBorderColor #E65100")
+    puml_lines.append("left to right direction")
+    puml_lines.append("")
+
+    # VPC 根节点
+    puml_lines.append(root_nodes[vpc_alias])
+
+    # VSwitch 及其内部节点
+    for vswitch_id in sorted(vswitch_groups, key=lambda item: (vswitch_groups[item]["label"], item)):
+        group = vswitch_groups[vswitch_id]
+        puml_lines.append(_plantuml_node_def(group["anchor_alias"], "vswitch", group["label"]))
+        for node_alias, node_def in group["nodes"].items():
+            puml_lines.append(node_def)
+
+    # 根级节点（排除 VPC 本身）
+    for alias, node_def in root_nodes.items():
+        if alias != vpc_alias:
+            puml_lines.append(node_def)
+
+    # 连线
+    for edge_line in edges:
+        puml_lines.append(edge_line)
+
+    puml_lines.append("@enduml")
+
+    # 包装为 Markdown
+    md_lines = [
+        f"# {title}",
+        "",
+        "- 说明：仅根据显式字段和确定性映射生成资源关系拓扑，不表示真实访问路径。",
+        "- 渲染：将 PlantUML 代码块复制到 [PlantUML Online Server](https://www.plantuml.com/plantuml/uml) 或使用 IDE 插件渲染。",
+    ]
+    if events:
+        md_lines.extend(
+            [
+                "",
+                "> 检测到部分关系缺失，相关接口失败如下：",
+                *[
+                    f"> - {row.get('service', '')} / {row.get('api', '')} / {row.get('message', '')}"
+                    for row in events
+                ],
+            ]
         )
-        add_root_node(node_id, "ssl_vpn", label_lines, row=row, resource_keys=("ssl_vpn_server_id", "resource_id"))
-        if parent_id:
-            add_edge(parent_id, node_id)
+    md_lines.extend(["", "```plantuml", *puml_lines, "```", ""])
+    return "\n".join(md_lines).rstrip() + "\n"
 
-    for node_id, node in list(nodes.items()):
-        if node_id != root_node_id and node_id not in incoming:
-            add_edge(root_node_id, node_id)
-
-    return TopologyRenderData(
-        subscription=subscription,
-        title=title,
-        root_label="<br/>".join(root_label_lines),
-        root_node_id=root_node_id,
-        nodes=nodes,
-        edges=edges,
-        resource_nodes=resource_nodes,
-        events=events,
-        group_ids=group_ids,
-    )
-
-
-def layout_topology_drawio_graph(graph: TopologyRenderData) -> tuple[int, int, list[str]]:
-    adjacency: dict[str, list[str]] = {}
-    indegree: dict[str, int] = {node_id: 0 for node_id in graph.nodes}
-    for source_id, target_id in graph.edges:
-        adjacency.setdefault(source_id, []).append(target_id)
-        indegree[target_id] = indegree.get(target_id, 0) + 1
-
-    queue = [graph.root_node_id]
-    topo_order: list[str] = []
-    seen: set[str] = set()
-    while queue:
-        node_id = queue.pop(0)
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-        topo_order.append(node_id)
-        for target_id in adjacency.get(node_id, []):
-            indegree[target_id] -= 1
-            if indegree[target_id] == 0:
-                queue.append(target_id)
-
-    for node_id in graph.nodes:
-        if node_id not in seen:
-            topo_order.append(node_id)
-
-    ranks: dict[str, int] = {graph.root_node_id: 0}
-    for node_id in topo_order:
-        base_rank = ranks.get(node_id, 0 if node_id == graph.root_node_id else 1)
-        for target_id in adjacency.get(node_id, []):
-            candidate_rank = base_rank + 1
-            if candidate_rank > ranks.get(target_id, -1):
-                ranks[target_id] = candidate_rank
-    for node_id in graph.nodes:
-        ranks.setdefault(node_id, 0 if node_id == graph.root_node_id else 1)
-
-    rank_to_nodes: dict[int, list[TopologyDiagramNode]] = {}
-    for node in graph.nodes.values():
-        rank_to_nodes.setdefault(ranks.get(node.node_id, 0), []).append(node)
-
-    page_width = 1600
-    cell_width = 260
-    cell_height = 128
-    horizontal_gap = 40
-    vertical_gap = 28
-    rank_gap = 60
-    note_lines = build_topology_note_lines(graph.events)
-    note_height = max(90, 18 + len(note_lines) * 18)
-
-    current_y = note_height + 40
-    for rank in sorted(rank_to_nodes):
-        nodes = sorted(
-            rank_to_nodes[rank],
-            key=lambda item: (
-                item.group_id or "~",
-                TOPOLOGY_KIND_ORDER.get(item.kind, 50),
-                item.label_lines[0] if item.label_lines else "",
-                item.node_id,
-            ),
-        )
-        if not nodes:
-            continue
-        columns = min(4, len(nodes))
-        rows = (len(nodes) + columns - 1) // columns
-        block_width = columns * cell_width + max(0, columns - 1) * horizontal_gap
-        start_x = max(40, (page_width - block_width) // 2)
-        for index, node in enumerate(nodes):
-            row_index = index // columns
-            column_index = index % columns
-            node.x = start_x + column_index * (cell_width + horizontal_gap)
-            node.y = current_y + row_index * (cell_height + vertical_gap)
-            node.width = cell_width
-            node.height = cell_height
-        current_y += rows * cell_height + max(0, rows - 1) * vertical_gap + rank_gap
-
-    page_height = current_y + 40
-    return page_width, page_height, note_lines
-
-
-def render_topology_drawio_xml(
-    graph: TopologyRenderData,
-    icons: dict[str, str],
-) -> str:
-    page_width, page_height, note_lines = layout_topology_drawio_graph(graph)
-    mxfile = ET.Element(
-        "mxfile",
-        {
-            "host": "app.diagrams.net",
-            "modified": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-            "agent": "aliyun-asset-sorting-tool",
-            "version": "24.7.5",
-            "type": "device",
-        },
-    )
-    diagram = ET.SubElement(mxfile, "diagram", {"id": "topology", "name": graph.title})
-    model = ET.SubElement(
-        diagram,
-        "mxGraphModel",
-        {
-            "dx": "0",
-            "dy": "0",
-            "grid": "1",
-            "gridSize": "10",
-            "guides": "1",
-            "tooltips": "1",
-            "connect": "1",
-            "arrows": "1",
-            "fold": "1",
-            "page": "1",
-            "pageScale": "1",
-            "pageWidth": str(page_width),
-            "pageHeight": str(page_height),
-            "math": "0",
-            "shadow": "0",
-        },
-    )
-    root = ET.SubElement(model, "root")
-    ET.SubElement(root, "mxCell", {"id": "0"})
-    ET.SubElement(root, "mxCell", {"id": "1", "parent": "0"})
-
-    next_cell_id = 2
-
-    note_id = str(next_cell_id)
-    next_cell_id += 1
-    note_cell = ET.SubElement(
-        root,
-        "mxCell",
-        {
-            "id": note_id,
-            "value": drawio_node_label(note_lines, bold_first=False),
-            "style": drawio_note_style(),
-            "vertex": "1",
-            "parent": "1",
-        },
-    )
-    ET.SubElement(
-        note_cell,
-        "mxGeometry",
-        {
-            "x": "40",
-            "y": "20",
-            "width": str(page_width - 80),
-            "height": str(max(90, 18 + len(note_lines) * 18)),
-            "as": "geometry",
-        },
-    )
-
-    ordered_nodes = sorted(
-        graph.nodes.values(),
-        key=lambda item: (
-            item.y,
-            item.x,
-            TOPOLOGY_KIND_ORDER.get(item.kind, 50),
-            item.node_id,
-        ),
-    )
-    node_cell_ids: dict[str, str] = {}
-    for node in ordered_nodes:
-        cell_id = str(next_cell_id)
-        next_cell_id += 1
-        node_cell_ids[node.node_id] = cell_id
-        icon_data = drawio_icon_data((node.icon_title,), icons) if node.icon_title else ""
-        cell = ET.SubElement(
-            root,
-            "mxCell",
-            {
-                "id": cell_id,
-                "value": drawio_node_label(node.label_lines),
-                "style": drawio_node_style(node.kind, icon_data),
-                "vertex": "1",
-                "parent": "1",
-            },
-        )
-        ET.SubElement(
-            cell,
-            "mxGeometry",
-            {
-                "x": str(node.x),
-                "y": str(node.y),
-                "width": str(node.width),
-                "height": str(node.height),
-                "as": "geometry",
-            },
-        )
-
-    for source_id, target_id in graph.edges:
-        source_cell_id = node_cell_ids.get(source_id, "")
-        target_cell_id = node_cell_ids.get(target_id, "")
-        if not source_cell_id or not target_cell_id:
-            continue
-        edge_cell = ET.SubElement(
-            root,
-            "mxCell",
-            {
-                "id": str(next_cell_id),
-                "style": drawio_edge_style(),
-                "edge": "1",
-                "parent": "1",
-                "source": source_cell_id,
-                "target": target_cell_id,
-            },
-        )
-        next_cell_id += 1
-        ET.SubElement(edge_cell, "mxGeometry", {"relative": "1", "as": "geometry"})
-
-    xml_body = ET.tostring(mxfile, encoding="unicode")
-    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + xml_body
-
-
-def build_topology_drawio_documents(
+def build_topology_plantuml_documents(
     raw_rows: list[dict[str, str]],
     details: DetailedAssets,
 ) -> dict[str, str]:
+    """调用共享归类层，为每个 VPC 桶生成 PlantUML 嵌入 Markdown 的拓扑文档。"""
     buckets = collect_topology_buckets(raw_rows, details)
-    icons = load_drawio_icon_library(str(default_drawio_icon_file()))
     docs: dict[str, str] = {}
     topology_entries: list[tuple[str, str, str]] = []
 
@@ -5429,36 +4407,32 @@ def build_topology_drawio_documents(
         region_id = vpc_row.get("region_id", "")
         vpc_name = resource_display_name(vpc_row, ("resource_name",), ("resource_id",)) if vpc_row else vpc_id
         title = f"{region_id or 'unknown'} / {vpc_name} / {vpc_id}"
-        filename = f"{safe_dirname(region_id or 'unknown')}__{safe_dirname(vpc_id)}.drawio"
+        filename = f"{safe_dirname(region_id or 'unknown')}__{safe_dirname(vpc_id)}.md"
         events = topology_collection_events(details, region_id=region_id, resource_ids=bucket["resource_ids"])
-        graph = build_topology_drawio_graph(
-            title,
-            buckets.subscription,
-            topology_label_lines("VPC", vpc_name, vpc_id),
+        docs[filename] = render_bucket_plantuml(
+            f"网络拓扑：{title}",
+            plantuml_label("VPC", vpc_name, vpc_id),
+            vpc_id,
             bucket,
             events,
-            icons,
         )
-        docs[filename] = render_topology_drawio_xml(graph, icons)
         topology_entries.append((filename, title, str(len(bucket["resource_ids"]))))
 
     unassigned_events = topology_collection_events(details, resource_ids=buckets.unassigned["resource_ids"])
-    unassigned_graph = build_topology_drawio_graph(
-        "未归属资源",
-        buckets.subscription,
-        topology_label_lines("未归属 VPC 的资源", buckets.subscription),
+    docs["unassigned.md"] = render_bucket_plantuml(
+        "网络拓扑：未归属资源",
+        plantuml_label("未归属 VPC 的资源", buckets.subscription),
+        "unassigned",
         buckets.unassigned,
         unassigned_events,
-        icons,
     )
-    docs["unassigned.drawio"] = render_topology_drawio_xml(unassigned_graph, icons)
 
     readme_lines = [
         "# 网络拓扑文件",
         "",
-        "- 说明：每个 `VPC` 单独输出一份 `draw.io` 拓扑图，保存在 `topology-drawio/` 目录，只展示显式字段和确定性映射能确认的关系。",
-        "- 边界：不按名称、同地域或同标签猜测依赖关系；未能确认 `VPC` 归属的资源会写入 `unassigned.drawio`。",
-        f"- 图标：优先读取 `{default_drawio_icon_file()}`，缺失时自动回退为通用节点样式。",
+        "- 说明：每个 `VPC` 单独输出一份 `PlantUML` 拓扑图，只展示显式字段和确定性映射能确认的关系。",
+        "- 边界：不按名称、同地域或同标签猜测依赖关系；未能确认 `VPC` 归属的资源会写入 `unassigned.md`。",
+        "- 渲染：将 PlantUML 代码块复制到 [PlantUML Online Server](https://www.plantuml.com/plantuml/uml) 或使用 IDE 插件渲染。",
         "",
         "## 文件列表",
     ]
@@ -5470,11 +4444,18 @@ def build_topology_drawio_documents(
     else:
         readme_lines.append("- 当前未识别到 VPC 资源。")
     readme_lines.append(
-        f"- [unassigned.drawio](./unassigned.drawio)：未能确认 VPC 归属的资源，资源ID数={len(buckets.unassigned['resource_ids'])}"
+        f"- [unassigned.md](./unassigned.md)：未能确认 VPC 归属的资源，资源ID数={len(buckets.unassigned['resource_ids'])}"
     )
     readme_lines.append("")
     docs["README.md"] = "\n".join(readme_lines)
     return docs
+
+
+def write_topology_documents(path: Path, documents: dict[str, str]) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for filename, content in documents.items():
+        write_text(path / filename, content)
+
 
 
 def build_report_sheets(
@@ -5872,23 +4853,18 @@ def parse_args() -> argparse.Namespace:
         dest="topology",
         action="store_true",
         default=True,
-        help="显式开启按 VPC 输出 Mermaid 网络拓扑 Markdown 文件（默认开启）",
+        help="显式开启按 VPC 输出 PlantUML 网络拓扑 Markdown 文件（默认开启）",
     )
     topology_group.add_argument(
         "--no-topology",
         dest="topology",
         action="store_false",
-        help="不输出 Mermaid 网络拓扑 Markdown 文件",
+        help="不输出 PlantUML 网络拓扑 Markdown 文件",
     )
     parser.add_argument(
         "--no-detail",
         action="store_true",
         help="不调用 ECS 等产品详情接口，只使用资源中心原始数据生成报告",
-    )
-    parser.add_argument(
-        "--drawio",
-        action="store_true",
-        help="额外输出 draw.io 网络拓扑文件（需要详情采集）",
     )
     parser.add_argument(
         "--no-checks",
@@ -5995,9 +4971,7 @@ def main() -> int:
             raise ValueError("--no-checks 和 --checks-only 不能同时使用")
         if args.topology and args.no_detail:
             raise ValueError("默认启用拓扑，--no-detail 需要配合 --no-topology 使用")
-        if args.drawio and args.no_detail:
-            raise ValueError("--drawio 需要详情采集，不能与 --no-detail 同时使用")
-        if args.no_raw_csv and args.no_report and checks_config is None and not args.topology and not args.drawio:
+        if args.no_raw_csv and args.no_report and checks_config is None and not args.topology:
             raise ValueError("--no-raw-csv 和 --no-report 不能同时使用")
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"[错误] {exc}", file=sys.stderr)
@@ -6080,18 +5054,10 @@ def main() -> int:
                 topology_path = topology_dir_for(args, subscription, len(subscriptions))
                 write_topology_documents(
                     topology_path,
-                    build_topology_documents(rows, details),
+                    build_topology_plantuml_documents(rows, details),
                 )
             else:
                 topology_path = None
-            if args.drawio:
-                topology_drawio_path = topology_drawio_dir_for(args, subscription, len(subscriptions))
-                write_topology_documents(
-                    topology_drawio_path,
-                    build_topology_drawio_documents(rows, details),
-                )
-            else:
-                topology_drawio_path = None
         except (AliyunCliError, ValueError, subprocess.TimeoutExpired) as exc:
             print(
                 f"[资产梳理] 失败 订阅={subscription.label} 错误={exc}",
@@ -6112,8 +5078,6 @@ def main() -> int:
             outputs.append(f"报告={report_path}")
         if topology_path:
             outputs.append(f"拓扑={topology_path}")
-        if topology_drawio_path:
-            outputs.append(f"拓扑Drawio={topology_drawio_path}")
         print(f"[资产梳理] 已导出={len(rows)} 订阅={subscription.label} {' '.join(outputs)}")
 
     if not args.verify_only and len(subscriptions) > 1 and not args.no_combined:

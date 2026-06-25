@@ -7,3 +7,4 @@ outputs/*
 .vscode/
 alibaba-cloud-icons-main/
 .claude/
+.aliyun-cli-bin/

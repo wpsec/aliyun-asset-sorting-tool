@@ -35,7 +35,7 @@ def raw_row(**overrides):
 
 class VerifyPermissionsTest(unittest.TestCase):
     def test_verify_permissions_timeout_is_counted_as_failure(self):
-        args = SimpleNamespace(region=None, timeout=7)
+        args = SimpleNamespace(region=None, timeout=7, cli_path="")
         subscription = inventory.Subscription(profile="dev", label="dev")
         timeout_error = subprocess.TimeoutExpired(
             cmd=["aliyun", "resourcecenter", "SearchResources"],
@@ -378,6 +378,7 @@ class MainValidationTest(unittest.TestCase):
             topology=True,
             no_detail=True,
             checks_only=False,
+            cli_path="",
         )
 
         with mock.patch.object(inventory, "parse_args", return_value=args), mock.patch.object(

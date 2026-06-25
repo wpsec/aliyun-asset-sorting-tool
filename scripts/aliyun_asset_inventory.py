@@ -13,9 +13,13 @@ import csv
 import dataclasses
 import datetime as dt
 import json
+import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import zipfile
 from pathlib import Path
@@ -521,6 +525,102 @@ def regex_group(pattern: str, text: str) -> str:
     return matched.group(1).strip()
 
 
+# ---------------------------------------------------------------------------
+# aliyun CLI 路径检测：优先系统安装，其次离线包，再次用户指定
+# ---------------------------------------------------------------------------
+_OFFLINE_CLI_DIR = PROJECT_ROOT / "aliyuncli"
+_UNPACKED_CLI_DIR = PROJECT_ROOT / ".aliyun-cli-bin"
+
+# 全局变量，由 resolve_aliyun_cli_path 设置后供 build_base_cmd 使用
+_ALIYUN_CLI_PATH: str = "aliyun"
+
+
+def _offline_tgz_candidates() -> list[Path]:
+    """查找 aliyuncli/ 目录下匹配当前平台的 tgz 离线包。"""
+    if not _OFFLINE_CLI_DIR.is_dir():
+        return []
+
+    cur_system = platform.system().lower()
+    cur_machine = platform.machine().lower()
+    # 将 platform.machine() 映射到 tgz 文件名中使用的架构标识
+    arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    arch_suffix = arch_map.get(cur_machine, cur_machine)
+
+    candidates: list[Path] = []
+    for tgz in sorted(_OFFLINE_CLI_DIR.glob("aliyun-cli-*.tgz")):
+        name = tgz.name.lower()
+        # 文件名约定: aliyun-cli-{system}-{version}-{arch}.tgz
+        if cur_system in name and arch_suffix in name:
+            candidates.append(tgz)
+    return candidates
+
+
+def _unpack_offline_cli(tgz_path: Path) -> Path:
+    """将离线 tgz 解压到 .aliyun-cli-bin/ 并返回 aliyun 二进制的绝对路径。"""
+    _UNPACKED_CLI_DIR.mkdir(parents=True, exist_ok=True)
+    target_binary = _UNPACKED_CLI_DIR / "aliyun"
+
+    # 如果已经解压且文件存在，跳过重复解压
+    if target_binary.is_file():
+        return target_binary
+
+    with tarfile.open(tgz_path, "r:gz") as tar:
+        tar.extractall(path=_UNPACKED_CLI_DIR, filter="data")
+
+    # 设置可执行权限
+    if target_binary.is_file():
+        target_binary.chmod(target_binary.stat().st_mode | 0o111)
+    else:
+        raise FileNotFoundError(
+            f"离线包 {tgz_path.name} 解压后未找到 aliyun 二进制文件"
+        )
+    return target_binary
+
+
+def resolve_aliyun_cli_path(cli_path_override: str = "") -> str:
+    """确定 aliyun CLI 可执行文件的路径。
+
+    检测顺序：
+    1. 用户通过 --cli-path 显式指定
+    2. 系统 PATH 中已安装的 aliyun CLI (shutil.which)
+    3. 项目离线包解压（仅当平台匹配时）
+
+    返回可执行文件的路径字符串，同时设置全局 _ALIYUN_CLI_PATH。
+    """
+    # 1) 用户显式指定
+    if cli_path_override:
+        p = Path(cli_path_override)
+        if not p.is_file():
+            raise FileNotFoundError(f"--cli-path 指定的文件不存在: {cli_path_override}")
+        return str(p.resolve())
+
+    # 2) 系统已安装
+    system_cli = shutil.which("aliyun")
+    if system_cli:
+        print(f"[CLI] 使用系统安装的 aliyun CLI: {system_cli}", file=sys.stderr)
+        return system_cli
+
+    # 3) 离线包
+    candidates = _offline_tgz_candidates()
+    if not candidates:
+        cur_info = f"{platform.system()}/{platform.machine()}"
+        available = [t.name for t in sorted(_OFFLINE_CLI_DIR.glob("*.tgz"))] if _OFFLINE_CLI_DIR.is_dir() else []
+        msg = (
+            f"系统未安装 aliyun CLI，且项目离线包不匹配当前平台({cur_info})。\n"
+            f"可用离线包: {available}\n"
+            f"请安装 aliyun CLI 或使用 --cli-path 指定路径。"
+        )
+        raise RuntimeError(msg)
+
+    tgz = candidates[0]
+    binary = _unpack_offline_cli(tgz)
+    print(
+        f"[CLI] 使用离线包 aliyun CLI: {binary} (来源: {tgz.name})",
+        file=sys.stderr,
+    )
+    return str(binary.resolve())
+
+
 def aliyun_error_detail(stdout: str, stderr: str) -> str:
     for text in (stderr, stdout):
         compact = compact_aliyun_error_text(text)
@@ -530,7 +630,7 @@ def aliyun_error_detail(stdout: str, stderr: str) -> str:
 
 
 def build_base_cmd(profile: str | None, region: str | None) -> list[str]:
-    cmd = ["aliyun"]
+    cmd = [_ALIYUN_CLI_PATH]
     if profile:
         cmd.extend(["--profile", profile])
     if region:
@@ -2673,7 +2773,7 @@ def collect_ram_details(
             if access_key_id:
                 try:
                     last_used_data = run_aliyun(
-                        ["ram", "GetAccessKeyLastUsed", "--UserAccessKeyId", access_key_id],
+                        ["ram", "GetAccessKeyLastUsed", "--UserName", user_name, "--UserAccessKeyId", access_key_id],
                         profile=subscription.profile,
                         region=args.region,
                         timeout=args.timeout,
@@ -5131,12 +5231,19 @@ def parse_args() -> argparse.Namespace:
         default=60,
         help="aliyun CLI 单次命令超时时间，单位秒",
     )
+    parser.add_argument(
+        "--cli-path",
+        default="",
+        help="aliyun CLI 可执行文件路径；未指定时自动检测系统安装或项目离线包",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     try:
         args = parse_args()
+        global _ALIYUN_CLI_PATH
+        _ALIYUN_CLI_PATH = resolve_aliyun_cli_path(args.cli_path)
         subscriptions = collect_subscriptions(args)
         checks_config = None
         if not args.no_checks and not args.verify_only:
@@ -5156,7 +5263,7 @@ def main() -> int:
             raise ValueError("默认启用拓扑，--no-detail 需要配合 --no-topology 使用")
         if args.no_raw_csv and args.no_report and checks_config is None and not args.topology:
             raise ValueError("--no-raw-csv 和 --no-report 不能同时使用")
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+    except (ValueError, OSError, json.JSONDecodeError, FileNotFoundError, RuntimeError) as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return 2
 

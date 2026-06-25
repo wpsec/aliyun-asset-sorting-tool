@@ -343,6 +343,8 @@ class DetailedAssets:
     ram_users: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ram_access_keys: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ram_user_mfa: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    ram_root_access_keys: list[dict[str, str]] = dataclasses.field(default_factory=list)
+    ram_user_policies: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ram_groups: list[dict[str, str]] = dataclasses.field(default_factory=list)
     ram_group_users: list[dict[str, str]] = dataclasses.field(default_factory=list)
     oss_buckets: list[dict[str, str]] = dataclasses.field(default_factory=list)
@@ -1403,6 +1405,48 @@ def normalize_ram_mfa(
         "resource_id": user_name,
         "mfa_enabled": "true" if pick(mfa_device, "SerialNumber") else "false",
         "serial_number": pick(mfa_device, "SerialNumber"),
+    }
+    return {key: str(value) for key, value in row.items()}
+
+
+def normalize_root_access_key(
+    item: dict[str, Any],
+    subscription: Subscription,
+    account_id: str,
+    last_used: dict[str, Any] | None,
+) -> dict[str, str]:
+    last_used = last_used or {}
+    row = {
+        "subscription": subscription.label,
+        "account_id": account_id,
+        "region_id": pick(last_used, "Region") or "global",
+        "user_name": "root",
+        "resource_id": "root",
+        "resource_name": "root",
+        "access_key_id": pick(item, "AccessKeyId"),
+        "status": pick(item, "Status"),
+        "create_date": pick(item, "CreateDate"),
+        "last_used_date": pick(last_used, "LastUsedDate"),
+        "last_used_service": pick(last_used, "ServiceName"),
+        "last_used_query_failed": pick(last_used, "QueryFailed"),
+    }
+    return {key: str(value) for key, value in row.items()}
+
+
+def normalize_ram_user_policy(
+    item: dict[str, Any],
+    subscription: Subscription,
+    account_id: str,
+    user_name: str,
+) -> dict[str, str]:
+    row = {
+        "subscription": subscription.label,
+        "account_id": account_id,
+        "region_id": "global",
+        "user_name": user_name,
+        "resource_id": user_name,
+        "policy_name": pick(item, "PolicyName"),
+        "policy_type": pick(item, "PolicyType"),
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -2579,6 +2623,51 @@ def collect_ram_details(
     account_id: str,
     details: DetailedAssets,
 ) -> None:
+    # Root 账号 AccessKey 采集 — 不传 UserName 即返回主账号 AK
+    # ListAccessKeys 无 UserName时不支持 --MaxItems 分页参数，且主账号最多 2 个 AK，直接调用即可
+    print(f"[资产梳理] Root AK采集中 订阅={subscription.label}", file=sys.stderr)
+    try:
+        root_keys_data = run_aliyun(
+            ["ram", "ListAccessKeys"],
+            profile=subscription.profile,
+            region=args.region,
+            timeout=args.timeout,
+        )
+        root_keys = extract_nested_list(root_keys_data, ("AccessKeys", "AccessKey"))
+        for key in root_keys:
+            last_used = {}
+            access_key_id = str(pick(key, "AccessKeyId"))
+            if access_key_id:
+                try:
+                    last_used_data = run_aliyun(
+                        ["ram", "GetAccessKeyLastUsed", "--UserAccessKeyId", access_key_id],
+                        profile=subscription.profile,
+                        region=args.region,
+                        timeout=args.timeout,
+                    )
+                    last_used = (
+                        last_used_data.get("AccessKeyLastUsed")
+                        if isinstance(last_used_data.get("AccessKeyLastUsed"), dict)
+                        else {}
+                    )
+                except (AliyunCliError, subprocess.TimeoutExpired):
+                    last_used = {"QueryFailed": "true"}
+            details.ram_root_access_keys.append(
+                normalize_root_access_key(key, subscription, account_id, last_used)
+            )
+    except (AliyunCliError, subprocess.TimeoutExpired) as exc:
+        print(f"[资产梳理] Root AK获取失败 订阅={subscription.label} 错误={exc}", file=sys.stderr)
+        record_collection_event(
+            details,
+            subscription,
+            account_id=account_id,
+            region_id="global",
+            service="ram",
+            api="ListAccessKeys(root)",
+            status="query_failed",
+            message=str(exc),
+        )
+
     try:
         users = marker_rpc_api(args, subscription, "ram", "ListUsers", [("Users", "User")])
         details.ram_users.extend(normalize_ram_user(item, subscription, account_id) for item in users)
@@ -2635,6 +2724,26 @@ def collect_ram_details(
         except (AliyunCliError, subprocess.TimeoutExpired):
             details.ram_user_mfa.append(
                 normalize_ram_mfa({}, subscription, account_id, user_name)
+            )
+
+        # RAM 用户直接授权策略采集
+        # ListPoliciesForUser 不支持 --MaxItems 分页参数，一次性返回全部策略
+        try:
+            policies_data = run_aliyun(
+                ["ram", "ListPoliciesForUser", "--UserName", user_name],
+                profile=subscription.profile,
+                region=args.region,
+                timeout=args.timeout,
+            )
+            policies = extract_nested_list(policies_data, ("Policies", "Policy"))
+            details.ram_user_policies.extend(
+                normalize_ram_user_policy(p, subscription, account_id, user_name) for p in policies
+            )
+        except (AliyunCliError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"[资产梳理] RAM用户策略获取失败 订阅={subscription.label} "
+                f"用户={user_name} 错误={exc}",
+                file=sys.stderr,
             )
 
     try:

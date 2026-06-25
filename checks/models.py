@@ -52,6 +52,10 @@ CHECK_ID_ALIASES = {
     "负载均衡无监听": "slb_without_listener",
     "服务器组无后端服务器": "slb_server_group_without_backend",
     "长期未使用AK": "ram_stale_access_key",
+    "AK无法确认使用状态": "ram_access_key_no_usage_record",
+    "Root账号存在AccessKey": "ram_root_access_key",
+    "AK长期未轮转": "ram_access_key_rotation",
+    "Inactive AK长期残留": "ram_inactive_access_key_cleanup",
     "RAM用户未启用MFA": "ram_user_without_mfa",
     "空RAM用户组": "ram_empty_group",
     "OSS Bucket未开启服务端加密": "oss_bucket_without_encryption",
@@ -126,6 +130,12 @@ class ChecksConfig:
     enabled: dict[str, bool]
     high_risk_ports: set[int]
     stale_access_key_days: int
+    stale_access_key_warn_days: int
+    stale_access_key_severe_days: int
+    access_key_rotation_days: int
+    inactive_access_key_cleanup_days: int
+    high_privilege_policy_names: set[str]
+    high_privilege_policy_count: int
     whitelist_resource_ids: set[str]
     whitelist_resource_group_ids: set[str]
     whitelist_tags: dict[str, set[str]]
@@ -151,6 +161,10 @@ class ChecksConfig:
                 "slb_without_listener": True,
                 "slb_server_group_without_backend": True,
                 "ram_stale_access_key": True,
+                "ram_access_key_no_usage_record": True,
+                "ram_root_access_key": True,
+                "ram_access_key_rotation": True,
+                "ram_inactive_access_key_cleanup": True,
                 "ram_user_without_mfa": True,
                 "ram_empty_group": True,
                 "oss_bucket_without_encryption": True,
@@ -168,6 +182,12 @@ class ChecksConfig:
             },
             high_risk_ports={22, 3389, 3306, 5432, 6379, 9200, 9300, 27017},
             stale_access_key_days=90,
+            stale_access_key_warn_days=30,
+            stale_access_key_severe_days=180,
+            access_key_rotation_days=365,
+            inactive_access_key_cleanup_days=90,
+            high_privilege_policy_names={"AdministratorAccess"},
+            high_privilege_policy_count=10,
             whitelist_resource_ids=set(),
             whitelist_resource_group_ids=set(),
             whitelist_tags={},
@@ -212,6 +232,54 @@ class ChecksConfig:
                 default=config.stale_access_key_days,
             )
         )
+        stale_warn_days = int(
+            config_value(
+                data,
+                "stale_access_key_warn_days",
+                "AK闲置低风险天数阈值",
+                default=config.stale_access_key_warn_days,
+            )
+        )
+        stale_severe_days = int(
+            config_value(
+                data,
+                "stale_access_key_severe_days",
+                "AK闲置高风险天数阈值",
+                default=config.stale_access_key_severe_days,
+            )
+        )
+        rotation_days = int(
+            config_value(
+                data,
+                "access_key_rotation_days",
+                "AK轮转天数阈值",
+                default=config.access_key_rotation_days,
+            )
+        )
+        inactive_cleanup_days = int(
+            config_value(
+                data,
+                "inactive_access_key_cleanup_days",
+                "Inactive AK清理天数阈值",
+                default=config.inactive_access_key_cleanup_days,
+            )
+        )
+        high_privilege_names = set(
+            config_value(
+                data,
+                "high_privilege_policy_names",
+                "高危策略名",
+                default=sorted(config.high_privilege_policy_names),
+            )
+        )
+        high_privilege_count = int(
+            config_value(
+                data,
+                "high_privilege_policy_count",
+                "高危策略数量阈值",
+                default=config.high_privilege_policy_count,
+            )
+        )
         whitelist = config_section(data, "whitelist", "白名单")
         whitelist_tags = normalize_whitelist_tags(whitelist.get("tags", []))
         if not whitelist_tags:
@@ -225,6 +293,12 @@ class ChecksConfig:
             enabled=enabled,
             high_risk_ports={int(port) for port in ports},
             stale_access_key_days=stale_days,
+            stale_access_key_warn_days=stale_warn_days,
+            stale_access_key_severe_days=stale_severe_days,
+            access_key_rotation_days=rotation_days,
+            inactive_access_key_cleanup_days=inactive_cleanup_days,
+            high_privilege_policy_names=high_privilege_names,
+            high_privilege_policy_count=high_privilege_count,
             whitelist_resource_ids={
                 str(item)
                 for item in config_value(

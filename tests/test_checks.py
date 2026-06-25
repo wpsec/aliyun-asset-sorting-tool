@@ -35,6 +35,8 @@ def make_details(**overrides):
         "nlb_server_group_servers": [],
         "ram_users": [],
         "ram_access_keys": [],
+        "ram_root_access_keys": [],
+        "ram_user_policies": [],
         "ram_user_mfa": [],
         "ram_groups": [],
         "ram_group_users": [],
@@ -334,18 +336,9 @@ class CheckRulesTest(unittest.TestCase):
 
     def test_whitelisted_resource_is_skipped(self):
         config = ChecksConfig.default()
-        config = config.__class__(
-            enabled=config.enabled,
-            high_risk_ports=config.high_risk_ports,
-            stale_access_key_days=config.stale_access_key_days,
+        config = dataclasses.replace(
+            config,
             whitelist_resource_ids={"d-001"},
-            whitelist_resource_group_ids=set(),
-            whitelist_tags={},
-            metric_checks_enabled=config.metric_checks_enabled,
-            metric_windows_days=config.metric_windows_days,
-            metric_period_seconds=config.metric_period_seconds,
-            metric_thresholds=config.metric_thresholds,
-            severity_threshold=config.severity_threshold,
         )
         findings = run_with(
             make_details(
@@ -503,7 +496,269 @@ class CheckRulesTest(unittest.TestCase):
         )
         self.assertIn("metric_idle_ecs", {item.check_id for item in findings})
 
-    def test_metric_normal_ecs_not_idle(self):
+    def test_root_access_key_active(self):
+        findings = run_with(
+            make_details(
+                ram_root_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "root",
+                        "resource_id": "root",
+                        "resource_name": "root",
+                        "access_key_id": "LTAI000000005678",
+                        "status": "Active",
+                        "create_date": "2025-06-01T00:00:00Z",
+                        "last_used_date": "2025-12-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_root_access_key"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("high", matched[0].severity)
+
+    def test_root_access_key_inactive_not_reported(self):
+        findings = run_with(
+            make_details(
+                ram_root_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "root",
+                        "resource_id": "root",
+                        "resource_name": "root",
+                        "access_key_id": "LTAI000000005678",
+                        "status": "Inactive",
+                        "create_date": "2025-06-01T00:00:00Z",
+                        "last_used_date": "",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn("ram_root_access_key", {item.check_id for item in findings})
+
+    def test_access_key_no_usage_record(self):
+        # Active AK 无 last_used_date，创建超过 30 天，应触发 no_usage_record 检查
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "unknown-usage-user",
+                        "access_key_id": "LTAI000000009999",
+                        "status": "Active",
+                        "create_date": "2025-01-01T00:00:00Z",
+                        "last_used_date": "",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_access_key_no_usage_record"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("low", matched[0].severity)
+
+    def test_access_key_no_usage_record_not_reported_when_has_last_used(self):
+        # Active AK 有 last_used_date 数据，不应触发 no_usage_record
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "has-usage-user",
+                        "access_key_id": "LTAI000000001000",
+                        "status": "Active",
+                        "create_date": "2025-01-01T00:00:00Z",
+                        "last_used_date": "2025-06-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn("ram_access_key_no_usage_record", {item.check_id for item in findings})
+
+    def test_stale_access_key_low_severity(self):
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "low-risk-user",
+                        "access_key_id": "LTAI000000001111",
+                        "status": "Active",
+                        "create_date": "2025-12-01T00:00:00Z",
+                        "last_used_date": "2026-03-23T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_stale_access_key"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("low", matched[0].severity)
+
+    def test_stale_access_key_medium_severity(self):
+        # 闲置约 100 天，落在 90-179 天区间，应为 medium
+        # now=2026-05-07, last_used=2026-01-27 -> 约 101 天
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "medium-user",
+                        "access_key_id": "LTAI000000002222",
+                        "status": "Active",
+                        "create_date": "2025-01-01T00:00:00Z",
+                        "last_used_date": "2026-01-27T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_stale_access_key"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("medium", matched[0].severity)
+
+    def test_stale_access_key_high_severity(self):
+        # 闲置 200 天，落在 >= 180 天区间，应为 high
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "high-user",
+                        "access_key_id": "LTAI000000003333",
+                        "status": "Active",
+                        "create_date": "2024-01-01T00:00:00Z",
+                        "last_used_date": "2024-10-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_stale_access_key"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("high", matched[0].severity)
+
+    def test_stale_access_key_privilege_upgrade(self):
+        # 闲置 45 天本来是 low，但绑定 AdministratorAccess，升级为 high
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "admin-user",
+                        "access_key_id": "LTAI000000004444",
+                        "status": "Active",
+                        "create_date": "2025-12-01T00:00:00Z",
+                        "last_used_date": "2026-03-23T00:00:00Z",
+                    }
+                ],
+                ram_user_policies=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "admin-user",
+                        "policy_name": "AdministratorAccess",
+                        "policy_type": "System",
+                    }
+                ]
+            )
+        )
+        matched = [item for item in findings if item.check_id == "ram_stale_access_key"]
+        self.assertTrue(len(matched) > 0)
+        self.assertEqual("high", matched[0].severity)
+
+    def test_access_key_rotation(self):
+        # AK 创建超过 365 天，应触发轮转巡检
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "long-lived-user",
+                        "access_key_id": "LTAI000000005555",
+                        "status": "Active",
+                        "create_date": "2024-01-01T00:00:00Z",
+                        "last_used_date": "2026-04-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        self.assertIn("ram_access_key_rotation", {item.check_id for item in findings})
+
+    def test_access_key_recent_not_rotation(self):
+        # AK 创建不到 365 天，不应触发轮转巡检
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "fresh-user",
+                        "access_key_id": "LTAI000000006666",
+                        "status": "Active",
+                        "create_date": "2026-01-01T00:00:00Z",
+                        "last_used_date": "2026-04-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn("ram_access_key_rotation", {item.check_id for item in findings})
+
+    def test_inactive_access_key_cleanup(self):
+        # Inactive AK 禁用超过 90 天，应触发清理巡检
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "disabled-user",
+                        "access_key_id": "LTAI000000007777",
+                        "status": "Inactive",
+                        "create_date": "2024-06-01T00:00:00Z",
+                        "last_used_date": "2025-06-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        self.assertIn("ram_inactive_access_key_cleanup", {item.check_id for item in findings})
+
+    def test_inactive_access_key_recent_not_cleanup(self):
+        # Inactive AK 禁用不到 90 天，不应触发清理巡检
+        findings = run_with(
+            make_details(
+                ram_access_keys=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "recent-disabled-user",
+                        "access_key_id": "LTAI000000008888",
+                        "status": "Inactive",
+                        "create_date": "2026-03-01T00:00:00Z",
+                        "last_used_date": "2026-03-01T00:00:00Z",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn("ram_inactive_access_key_cleanup", {item.check_id for item in findings})
         config = dataclasses.replace(ChecksConfig.default(), metric_checks_enabled=True)
         findings = run_with(
             make_details(

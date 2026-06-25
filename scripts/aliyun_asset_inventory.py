@@ -242,6 +242,19 @@ ECS_SECURITY_GROUP_COLUMNS = [
     ("tags", "标签"),
 ]
 
+ACCESS_KEY_COLUMNS = [
+    ("subscription", "订阅"),
+    ("account_id", "账号ID"),
+    ("region_id", "地域"),
+    ("user_name", "用户名"),
+    ("access_key_id", "AccessKey ID（脱敏）"),
+    ("status", "状态"),
+    ("create_date", "创建时间"),
+    ("last_used_date", "最后使用时间"),
+    ("last_used_service", "最后调用服务"),
+    ("last_used_query_failed", "使用记录查询失败"),
+]
+
 SAS_VULNERABILITY_COLUMNS = [
     ("subscription", "订阅"),
     ("account_id", "账号ID"),
@@ -2626,51 +2639,6 @@ def collect_ram_details(
     account_id: str,
     details: DetailedAssets,
 ) -> None:
-    # Root 账号 AccessKey 采集 — 不传 UserName 即返回主账号 AK
-    # ListAccessKeys 无 UserName时不支持 --MaxItems 分页参数，且主账号最多 2 个 AK，直接调用即可
-    print(f"[资产梳理] Root AK采集中 订阅={subscription.label}", file=sys.stderr)
-    try:
-        root_keys_data = run_aliyun(
-            ["ram", "ListAccessKeys"],
-            profile=subscription.profile,
-            region=args.region,
-            timeout=args.timeout,
-        )
-        root_keys = extract_nested_list(root_keys_data, ("AccessKeys", "AccessKey"))
-        for key in root_keys:
-            last_used = {}
-            access_key_id = str(pick(key, "AccessKeyId"))
-            if access_key_id:
-                try:
-                    last_used_data = run_aliyun(
-                        ["ram", "GetAccessKeyLastUsed", "--UserAccessKeyId", access_key_id],
-                        profile=subscription.profile,
-                        region=args.region,
-                        timeout=args.timeout,
-                    )
-                    last_used = (
-                        last_used_data.get("AccessKeyLastUsed")
-                        if isinstance(last_used_data.get("AccessKeyLastUsed"), dict)
-                        else {}
-                    )
-                except (AliyunCliError, subprocess.TimeoutExpired):
-                    last_used = {"QueryFailed": "true"}
-            details.ram_root_access_keys.append(
-                normalize_root_access_key(key, subscription, account_id, last_used)
-            )
-    except (AliyunCliError, subprocess.TimeoutExpired) as exc:
-        print(f"[资产梳理] Root AK获取失败 订阅={subscription.label} 错误={exc}", file=sys.stderr)
-        record_collection_event(
-            details,
-            subscription,
-            account_id=account_id,
-            region_id="global",
-            service="ram",
-            api="ListAccessKeys(root)",
-            status="query_failed",
-            message=str(exc),
-        )
-
     try:
         users = marker_rpc_api(args, subscription, "ram", "ListUsers", [("Users", "User")])
         details.ram_users.extend(normalize_ram_user(item, subscription, account_id) for item in users)
@@ -2682,16 +2650,21 @@ def collect_ram_details(
         user_name = str(pick(item, "UserName"))
         if not user_name:
             continue
+        # ListAccessKeys 不支持 --MaxItems 分页参数，且每个用户最多 2 个 AK，直接调用即可
         try:
-            keys = marker_rpc_api(
-                args,
-                subscription,
-                "ram",
-                "ListAccessKeys",
-                [("AccessKeys", "AccessKey")],
-                extra_args=["--UserName", user_name],
+            keys_data = run_aliyun(
+                ["ram", "ListAccessKeys", "--UserName", user_name],
+                profile=subscription.profile,
+                region=args.region,
+                timeout=args.timeout,
             )
-        except (AliyunCliError, subprocess.TimeoutExpired):
+            keys = extract_nested_list(keys_data, ("AccessKeys", "AccessKey"))
+        except (AliyunCliError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"[资产梳理] RAM用户AK获取失败 订阅={subscription.label} "
+                f"用户={user_name} 错误={exc}",
+                file=sys.stderr,
+            )
             keys = []
 
         for key in keys:
@@ -2748,6 +2721,81 @@ def collect_ram_details(
                 f"用户={user_name} 错误={exc}",
                 file=sys.stderr,
             )
+
+    # Root 账号 AccessKey 采集
+    # 子用户调用 ListAccessKeys（无 UserName）返回的是自身 AK，不是主账号 AK。
+    # 先收集所有子用户 AK ID，再从无 UserName 调用结果中排除它们，剩余的才是主账号 AK。
+    # 如果全部都被排除，说明当前身份是子用户且无法查看主账号 AK。
+    print(f"[资产梳理] Root AK采集中 订阅={subscription.label}", file=sys.stderr)
+    sub_user_ak_ids = {
+        row.get("access_key_id", "")
+        for row in details.ram_access_keys
+        if row.get("access_key_id")
+    }
+    try:
+        root_keys_data = run_aliyun(
+            ["ram", "ListAccessKeys"],
+            profile=subscription.profile,
+            region=args.region,
+            timeout=args.timeout,
+        )
+        all_keys = extract_nested_list(root_keys_data, ("AccessKeys", "AccessKey"))
+        # 过滤掉属于子用户的 AK（调用者自身的 AK）
+        root_only_keys = [
+            key for key in all_keys
+            if str(pick(key, "AccessKeyId")) not in sub_user_ak_ids
+        ]
+        if root_only_keys:
+            for key in root_only_keys:
+                last_used = {}
+                access_key_id = str(pick(key, "AccessKeyId"))
+                if access_key_id:
+                    try:
+                        last_used_data = run_aliyun(
+                            ["ram", "GetAccessKeyLastUsed", "--UserAccessKeyId", access_key_id],
+                            profile=subscription.profile,
+                            region=args.region,
+                            timeout=args.timeout,
+                        )
+                        last_used = (
+                            last_used_data.get("AccessKeyLastUsed")
+                            if isinstance(last_used_data.get("AccessKeyLastUsed"), dict)
+                            else {}
+                        )
+                    except (AliyunCliError, subprocess.TimeoutExpired):
+                        last_used = {"QueryFailed": "true"}
+                details.ram_root_access_keys.append(
+                    normalize_root_access_key(key, subscription, account_id, last_used)
+                )
+        else:
+            # 全部 AK 都属于子用户 — 当前身份无法查看主账号 AK，记录采集受限
+            print(
+                f"[资产梳理] Root AK状态无法确认 订阅={subscription.label} "
+                f"原因=子用户身份无法查看主账号AK",
+                file=sys.stderr,
+            )
+            record_collection_event(
+                details,
+                subscription,
+                account_id=account_id,
+                region_id="global",
+                service="ram",
+                api="ListAccessKeys(root)",
+                status="query_failed",
+                message="子用户身份无法查看主账号AK，ram_root_access_key 巡检项不适用",
+            )
+    except (AliyunCliError, subprocess.TimeoutExpired) as exc:
+        print(f"[资产梳理] Root AK获取失败 订阅={subscription.label} 错误={exc}", file=sys.stderr)
+        record_collection_event(
+            details,
+            subscription,
+            account_id=account_id,
+            region_id="global",
+            service="ram",
+            api="ListAccessKeys(root)",
+            status="query_failed",
+            message=str(exc),
+        )
 
     try:
         groups = marker_rpc_api(args, subscription, "ram", "ListGroups", [("Groups", "Group")])
@@ -3772,6 +3820,28 @@ def collection_event_rows(details: DetailedAssets) -> list[dict[str, str]]:
     return rows
 
 
+def _mask_id(value: str) -> str:
+    """脱敏标识符，与 checks/helpers.masked_identifier 规格一致。"""
+    text = str(value or "")
+    if len(text) <= 8:
+        return "****"
+    return f"{text[:4]}****{text[-4:]}"
+
+
+def access_key_rows(details: DetailedAssets) -> list[dict[str, str]]:
+    """合并 Root AK 和子用户 AK，脱敏后输出到 RAM AccessKey 工作表。"""
+    rows = []
+    for key in details.ram_root_access_keys:
+        row = dict(key)
+        row["access_key_id"] = _mask_id(row.get("access_key_id", ""))
+        rows.append(row)
+    for key in details.ram_access_keys:
+        row = dict(key)
+        row["access_key_id"] = _mask_id(row.get("access_key_id", ""))
+        rows.append(row)
+    return rows
+
+
 def collection_event_from_row(
     row: dict[str, str],
     service: str,
@@ -4628,6 +4698,7 @@ def build_report_sheets(
             Sheet("ECS磁盘", ECS_DISK_COLUMNS, details.ecs_disks),
             Sheet("ECS安全组", ECS_SECURITY_GROUP_COLUMNS, details.ecs_security_groups),
             Sheet("ECS快照", RAW_RESOURCE_COLUMNS, ecs_snapshot_rows),
+            Sheet("RAM AccessKey", ACCESS_KEY_COLUMNS, access_key_rows(details)),
             Sheet("网络与负载均衡", RAW_RESOURCE_COLUMNS, filter_by_service(raw_rows, network_services)),
             Sheet("数据库", RAW_RESOURCE_COLUMNS, filter_by_service(raw_rows, database_services)),
             Sheet("存储", RAW_RESOURCE_COLUMNS, filter_by_service(raw_rows, storage_services)),

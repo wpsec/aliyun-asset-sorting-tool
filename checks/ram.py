@@ -341,15 +341,22 @@ def check_users_without_mfa(context: CheckContext) -> list[CheckFinding]:
     if not context.config.is_enabled(check_id):
         return []
 
+    # MFA 查询失败的用户无法判断 MFA 状态，跳过以避免误判
+    mfa_query_failed = {
+        row.get("user_name", "")
+        for row in context.details.ram_user_mfa
+        if row.get("user_name") and row.get("mfa_query_failed") == "true"
+    }
     mfa_users = {
         row.get("user_name", "")
         for row in context.details.ram_user_mfa
         if row.get("user_name") and row.get("mfa_enabled") == "true"
+        and row.get("mfa_query_failed") != "true"
     }
     findings = []
     for user in context.details.ram_users:
         user_name = user.get("user_name", "")
-        if not user_name or user_name in mfa_users:
+        if not user_name or user_name in mfa_users or user_name in mfa_query_failed:
             continue
         findings.append(
             finding(

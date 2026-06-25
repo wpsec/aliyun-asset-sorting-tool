@@ -1395,6 +1395,8 @@ def normalize_ram_mfa(
     subscription: Subscription,
     account_id: str,
     user_name: str,
+    *,
+    query_failed: bool = False,
 ) -> dict[str, str]:
     mfa_device = item.get("MFADevice") if isinstance(item.get("MFADevice"), dict) else {}
     row = {
@@ -1405,6 +1407,7 @@ def normalize_ram_mfa(
         "resource_id": user_name,
         "mfa_enabled": "true" if pick(mfa_device, "SerialNumber") else "false",
         "serial_number": pick(mfa_device, "SerialNumber"),
+        "mfa_query_failed": "true" if query_failed else "false",
     }
     return {key: str(value) for key, value in row.items()}
 
@@ -2723,7 +2726,7 @@ def collect_ram_details(
             details.ram_user_mfa.append(normalize_ram_mfa(mfa_data, subscription, account_id, user_name))
         except (AliyunCliError, subprocess.TimeoutExpired):
             details.ram_user_mfa.append(
-                normalize_ram_mfa({}, subscription, account_id, user_name)
+                normalize_ram_mfa({}, subscription, account_id, user_name, query_failed=True)
             )
 
         # RAM 用户直接授权策略采集

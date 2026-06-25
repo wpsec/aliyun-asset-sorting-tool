@@ -759,6 +759,36 @@ class CheckRulesTest(unittest.TestCase):
             )
         )
         self.assertNotIn("ram_inactive_access_key_cleanup", {item.check_id for item in findings})
+
+    def test_mfa_query_failed_user_not_reported_as_without_mfa(self):
+        # GetUserMFAInfo 权限不足时查询失败，不应误判为"未启用 MFA"
+        findings = run_with(
+            make_details(
+                ram_users=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "mfa-failed-user",
+                        "resource_id": "mfa-failed-user",
+                    }
+                ],
+                ram_user_mfa=[
+                    {
+                        "subscription": "dev",
+                        "account_id": "1001",
+                        "region_id": "global",
+                        "user_name": "mfa-failed-user",
+                        "resource_id": "mfa-failed-user",
+                        "mfa_enabled": "false",
+                        "mfa_query_failed": "true",
+                    }
+                ]
+            )
+        )
+        self.assertNotIn("ram_user_without_mfa", {item.check_id for item in findings})
+
+    def test_metric_idle_ecs(self):
         config = dataclasses.replace(ChecksConfig.default(), metric_checks_enabled=True)
         findings = run_with(
             make_details(
